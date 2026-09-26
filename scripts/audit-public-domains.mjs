@@ -6,7 +6,7 @@
  * Other corporate deployment hostnames must be supplied at runtime instead
  * of committed.
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -31,6 +31,10 @@ const generatedDirectories = new Set(['node_modules', 'dist', 'doc_build']);
 const selfPath = fileURLToPath(import.meta.url);
 
 function* walk(path) {
+  // Some roots intentionally exist only in the upstream development checkout.
+  // GitHub source archives omit ignored and empty directories, so their absence
+  // must not make a public source installation impossible to build.
+  if (!existsSync(path)) return;
   const stats = statSync(path);
   if (stats.isFile()) {
     yield path;
