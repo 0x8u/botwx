@@ -1,0 +1,1694 @@
+/**
+ * Incremental reader for Claude Code transcript JSONL files.
+ *
+ * Used by the adopt-bridge pipeline (worker.ts) to:
+ *   1. baseline the transcript at attach time so historical messages aren't
+ *      replayed to Lark.
+ *   2. drain newly-appended assistant messages between user turns.
+ *   3. tolerate truncation, rotation, half-written JSON lines, and races with
+ *      Claude Code's writer.
+ *
+ * The functions are pure (no fs.watch — that's the worker's wakeup concern)
+ * to keep them unit-testable.
+ */
+import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
+import type { ModelFallbackState } from '../types.js';
+// cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
+// dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+
+/** Subset of Claude Code's JSONL event shape we care about. */
+export interface TranscriptEvent {
+  type?: string;
+  subtype?: string;
+  uuid?: string;
+  sessionId?: string;
+  timestamp?: string;
+  message?: {
+    role?: string;
+    content?: unknown;
+    /** Claude's API stop reason. `tool_use` is an intra-turn pause; terminal
+     * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
+    stop_reason?: string | null;
+    /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
+     *  Code writes the placeholder `<synthetic>` on records no model produced:
+     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
+     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
+    model?: string;
+  };
+  /** API-error records. When the model call fails, Claude Code writes a
+   *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
+   *  `error` code (e.g. "rate_limit", "server_error", "authentication_failed",
+   *  "unknown") plus the HTTP `apiErrorStatus`. These carry a human-readable
+   *  text block ("You've hit your session limit · resets 10:40pm"), so they
+   *  must be excluded from assistant-reply forwarding (they are not a model
+   *  answer) and, for rate_limit, routed to usage-limit detection instead. */
+  error?: string;
+  errorDetails?: unknown;
+  isApiErrorMessage?: boolean;
+  apiErrorStatus?: number;
+  /** Present on `type:"attachment"` lines. The bridge attribution queue
+   *  treats `attachment.type === "queued_command"` as a turn-start signal —
+   *  Claude writes one of these the moment it dequeues a type-ahead
+   *  submission, immediately before the assistant's reply for that turn
+   *  starts streaming. `prompt` carries the same content the user typed;
+   *  shape is usually `string` but we tolerate the message-style array form
+   *  via stringifyUserContent. */
+  attachment?: {
+    type?: string;
+    prompt?: unknown;
+    commandMode?: string;
+  };
+  /** Present on `type:"system"` model-switch records (see
+   *  {@link parseClaudeModelFallbackEvent}). `scope:"local"` marks a sub-agent /
+   *  side-question fallback that leaves the main session model untouched. */
+  scope?: string;
+  trigger?: string;
+  originalModel?: string;
+  fallbackModel?: string;
+  apiRefusalCategory?: string;
+  /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
+   *  a FORKED session: the record is history the fork inherited, and the switch
+   *  it describes does NOT apply to this conversation. Treated as positive
+   *  evidence of "no notice here", exactly like a non-Fable switch. */
+  neutralizedByFork?: boolean;
+}
+
+/**
+ * True when an event is Claude Code's structured rate-limit record: an
+ * `isApiErrorMessage` line whose machine `error` code is "rate_limit" (429).
+ * This is the authoritative "we are rate limited" signal — far more reliable
+ * than scraping the TUI, and it lands exactly at the turn's terminal boundary.
+ * The caller turns this into a `limited` session state via
+ * structuredRateLimitState(); it must NOT be forwarded as an assistant reply.
+ */
+export function isTranscriptRateLimitEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  return ev.error === 'rate_limit' || ev.apiErrorStatus === 429;
+}
+
+/** Concatenated text blocks of an API-error record, used to recover a human
+ *  retry clock ("... resets 10:40pm") when present. Returns '' if none. */
+export function apiErrorMessageText(ev: TranscriptEvent): string {
+  const content = ev.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b: any) => b.text)
+      .join(' ');
+  }
+  return '';
+}
+
+/** Kind of automatic model switch Claude Code recorded, mapped from the raw
+ *  `type:"system"` subtype so the card copy can branch on one stable value. */
+export type ClaudeModelFallbackKind = 'refusal' | 'unavailable' | 'consent';
+
+const MODEL_FALLBACK_KIND_BY_SUBTYPE: Record<string, ClaudeModelFallbackKind> = {
+  model_refusal_fallback: 'refusal',
+  model_fallback: 'unavailable',
+  model_consent_fallback: 'consent',
+};
+
+/** One parsed model-switch record. `scope: 'local'` is a sub-agent /
+ *  side-question fallback: the main session model did NOT change, so surfacing
+ *  it would mislead. Builds that predate the field omit it and read as
+ *  'session'.
+ *
+ *  EVERY session-scoped switch parses, including the ones that must NOT raise a
+ *  notice — `fable: false` (a routine Opus 5 → Opus 4.8 downgrade) and
+ *  `neutralizedByFork` (a record a fork inherited). Dropping those at parse time
+ *  was a bug: the backward tail scan would step straight over the newest record
+ *  and resurrect an OLDER Fable one, so a notice the user had already left
+ *  behind came back. They are positive evidence of "no notice", which only the
+ *  newest record can express — see {@link noticeFromSessionRecord}. */
+export interface ClaudeModelFallbackRecord extends ModelFallbackState {
+  scope: 'session' | 'local';
+  /** The configured model this switch fell OFF was a Fable one. Only a fall off
+   *  Fable is a product-visible notice. */
+  fable: boolean;
+  /** The record was copied into a fork and does not apply here. */
+  neutralizedByFork: boolean;
+}
+
+/** Product state the NEWEST session-scoped record implies: the record itself
+ *  when it is a live Fable fallback, or `null` when it says positively that no
+ *  notice applies here (fell off a non-Fable model, or a fork neutralised it).
+ *  `null` is evidence, not absence — the daemon clears on it. */
+function noticeFromSessionRecord(
+  rec: ClaudeModelFallbackRecord,
+): ClaudeModelFallbackRecord | null {
+  return rec.fable && !rec.neutralizedByFork ? rec : null;
+}
+
+/** Normalise a model id for comparison: drop a trailing context-window suffix
+ *  and lower-case. `originalModel` is written as `claude-fable-5-1[1m]` while an
+ *  assistant record's `message.model` is the bare `claude-fable-5-1`; without
+ *  this the "user switched back" check can never fire. */
+export function normalizeClaudeModelId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\[[^\]]*\]$/, '').trim().toLowerCase();
+  return normalized || undefined;
+}
+
+/** True when a model id names a Fable model, whatever its case or context
+ *  suffix (`claude-fable-5-1[1m]`, `Claude-Fable-5[1M]`, …). The single
+ *  PREDICATE behind the product's "Fable only" scope: the parse records its
+ *  verdict on each switch as `fable`, and noticeFromSessionRecord is the only
+ *  place that turns it into "show / do not show". */
+export function isFableModelId(value: string | undefined): boolean {
+  return normalizeClaudeModelId(value)?.startsWith('claude-fable') === true;
+}
+
+/** Parse a `type:"system"` model-switch record. Returns undefined for anything
+ *  else, and fail-closed for a record missing the uuid or either model id —
+ *  a half-written switch must not produce a notice we can never clear. */
+export function parseClaudeModelFallbackEvent(
+  ev: TranscriptEvent,
+): ClaudeModelFallbackRecord | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system') return undefined;
+  const kind = typeof ev.subtype === 'string'
+    ? MODEL_FALLBACK_KIND_BY_SUBTYPE[ev.subtype]
+    : undefined;
+  if (!kind) return undefined;
+  const uuid = typeof ev.uuid === 'string' ? ev.uuid.trim() : '';
+  const originalModel = typeof ev.originalModel === 'string' ? ev.originalModel.trim() : '';
+  const fallbackModel = typeof ev.fallbackModel === 'string' ? ev.fallbackModel.trim() : '';
+  if (!uuid || !originalModel || !fallbackModel) return undefined;
+  const trigger = typeof ev.trigger === 'string' ? ev.trigger.trim() : '';
+  const apiRefusalCategory = typeof ev.apiRefusalCategory === 'string'
+    ? ev.apiRefusalCategory.trim()
+    : '';
+  const observedAt = typeof ev.timestamp === 'string' ? ev.timestamp.trim() : '';
+  return {
+    uuid,
+    kind,
+    originalModel,
+    fallbackModel,
+    scope: ev.scope === 'local' ? 'local' : 'session',
+    // PRODUCT DECISION: only a fall *off Fable* is surfaced. Claude Code also
+    // records ordinary safety downgrades between non-Fable models (Opus 5 →
+    // Opus 4.8), which are routine and must stay invisible. Recorded as a flag
+    // rather than a parse rejection so the newest record still terminates the
+    // tail scan — see {@link ClaudeModelFallbackRecord}.
+    fable: isFableModelId(originalModel),
+    neutralizedByFork: ev.neutralizedByFork === true,
+    ...(trigger ? { trigger } : {}),
+    ...(apiRefusalCategory ? { apiRefusalCategory } : {}),
+    ...(observedAt ? { observedAt } : {}),
+  };
+}
+
+/** Model that actually served an assistant record. Sub-agent output, API-error
+ *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
+ *  model, so they yield undefined rather than a false "model changed". */
+export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
+  if (!ev || typeof ev !== 'object') return undefined;
+  if ((ev as any).isSidechain === true) return undefined;
+  if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
+  if ((ev.message?.role ?? ev.type) !== 'assistant') return undefined;
+  const model = ev.message?.model?.trim();
+  if (!model || model === '<synthetic>') return undefined;
+  return model;
+}
+
+/** Drop the transcript-only parse bookkeeping (`scope`, `fable`,
+ *  `neutralizedByFork`): what ships to the daemon and gets persisted is the
+ *  product state. */
+export function modelFallbackStateOf(rec: ClaudeModelFallbackRecord): ModelFallbackState {
+  const { scope: _scope, fable: _fable, neutralizedByFork: _neutralized, ...state } = rec;
+  return state;
+}
+
+/** Upper bound on the backward scan below. Same guard rationale as
+ *  TRAEX_RUNTIME_SCAN_MAX_BYTES: the fallback notice is advisory and must never
+ *  synchronously parse a multi-GB transcript at bridge start. */
+const CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Recover the current model-fallback state from a transcript's tail, for the
+ *  worker's cold start: baseline cursors straight to EOF, so a switch recorded
+ *  before `--resume` / a daemon restart is never drained again.
+ *
+ *  Scans BACKWARD and stops at the newest session-scoped switch record — the
+ *  newest one DECIDES, whatever it says. When it is a live Fable fallback it is
+ *  returned; when it fell off a non-Fable model or a fork neutralised it, the
+ *  scan returns `fallback: null`, which is positive evidence that no notice
+ *  applies. Stepping over such a record to keep hunting for an older Fable one
+ *  (the previous behaviour) resurrects a notice the session already left
+ *  behind. `fallback` absent means the window simply held no session-scoped
+ *  record — no evidence either way.
+ *
+ *  The serving model is only collected from records NEWER than that stop point
+ *  (an assistant reply written before the switch says nothing about what serves
+ *  now). With no switch record in the window the serving model is simply the
+ *  window's newest one — still useful, because the daemon compares it against
+ *  the fallback IT persisted. A non-newline-terminated tail is excluded via
+ *  baselineJsonlCursor. */
+export function readLatestClaudeModelFallback(path: string): {
+  fallback?: ClaudeModelFallbackRecord | null;
+  servingModel?: string;
+} {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let fallback: ClaudeModelFallbackRecord | null | undefined;
+  let servingModel: string | undefined;
+  const emit = () => ({
+    ...(fallback !== undefined ? { fallback } : {}),
+    ...(servingModel ? { servingModel } : {}),
+  });
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let ev: TranscriptEvent;
+    try { ev = JSON.parse(line) as TranscriptEvent; } catch { return false; }
+    if (!ev || typeof ev !== 'object') return false;
+    const rec = parseClaudeModelFallbackEvent(ev);
+    if (rec) {
+      if (rec.scope === 'local') return false;
+      fallback = noticeFromSessionRecord(rec);
+      return true;
+    }
+    if (!servingModel) servingModel = servingModelFromAssistantEvent(ev);
+    return false;
+  };
+
+  const floor = Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      // Drop the leading fragment only at the byte-cap floor (a truncated
+      // historical partial); at true file start it is a complete record.
+      carry = start === floor && floor > 0 ? Buffer.alloc(0) : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
+}
+
+/** Bound on the tracker's dedupe set. A long session can switch models many
+ *  times, so an unbounded set would leak slowly. */
+const MODEL_FALLBACK_SEEN_UUIDS_MAX = 256;
+
+/** One report from the worker to the daemon: OBSERVED FACTS ONLY, never a
+ *  decision. The worker cannot decide whether the notice should still show —
+ *  its transcript window is bounded and it is younger than the session — so it
+ *  says what it saw and the daemon, which holds the persisted state, merges:
+ *
+ *   - `claudeSessionId` — WHICH Claude conversation these facts are about. The
+ *     state is per Claude session: `/repo`, `/adopt` and a resume onto another
+ *     native session all replace it, and state carried over from the previous
+ *     one is either a notice for a conversation this session is no longer
+ *     having or (worse) one that can never be cleared. Always present.
+ *   - `fallback` — a switch record it had not reported before, or `null` when
+ *     the newest session-scoped record is positive evidence that NO notice
+ *     applies (fell off a non-Fable model, or neutralised by a fork).
+ *   - `servingModel` — the model serving the MAIN thread, whenever that value
+ *     changed since its last report. Not gated on Fable: it also drives the
+ *     card's usage line, since Claude never emits `active_runtime`.
+ *
+ *  An ABSENT `fallback` / `servingModel` means "nothing new observed", never
+ *  "cleared" — only `fallback: null`, or a `claudeSessionId` that disagrees
+ *  with the held state, clears. */
+export interface ModelFallbackObservation {
+  claudeSessionId: string;
+  fallback?: ModelFallbackState | null;
+  servingModel?: string;
+}
+
+/** Running model-fallback observer for ONE Claude session. Owns the record-uuid
+ *  dedupe (the same record is re-drained after a truncation or a jsonl switch),
+ *  the "only report the serving model when it changed" rule, and the binding to
+ *  the Claude session id all of that describes — so the worker is left with
+ *  nothing but "did I see anything worth sending". */
+export class ClaudeModelFallbackTracker {
+  /** Claude session (jsonl basename) every remembered fact belongs to. Empty
+   *  until the first {@link bind}. */
+  private claudeSessionId = '';
+  private readonly seenUuids = new Set<string>();
+  /** Last serving model reported to the daemon, normalised. `undefined` = none
+   *  reported yet for the bound session, so the first one always ships. */
+  private reportedServingModel: string | undefined;
+
+  get boundClaudeSessionId(): string {
+    return this.claudeSessionId;
+  }
+
+  /** Bind to `claudeSessionId`, returning true when that was a SWITCH. A
+   *  different id means the bridge moved to another Claude conversation
+   *  (`/repo`, `/adopt`, a resume onto another native session, an in-pane
+   *  `/clear`): every uuid we deduped and every serving model we reported
+   *  describes the old one, so all of it is dropped. Without this the new
+   *  session inherits the old one's notice, and — when its real model happens
+   *  to equal the old fallback — the serving-model dedupe swallows the very
+   *  observation that would have cleared it, leaving a false notice that
+   *  survives restarts. */
+  bind(claudeSessionId: string): boolean {
+    if (claudeSessionId === this.claudeSessionId) return false;
+    this.claudeSessionId = claudeSessionId;
+    this.reset();
+    return true;
+  }
+
+  /** Forget everything remembered about the bound session. */
+  reset(): void {
+    this.seenUuids.clear();
+    this.reportedServingModel = undefined;
+  }
+
+  /** Fold newly-drained events in, newest last, and return what the daemon has
+   *  not been told yet (or null when there is nothing new). `scope:"local"`
+   *  records are skipped outright: a sub-agent fell back on its own and the
+   *  main session model is untouched. A session-scoped record that is NOT a
+   *  live Fable fallback still counts — it reports `fallback: null`, the
+   *  positive "no notice here" the daemon clears on.
+   *
+   *  Whatever the batch holds, the NEWEST session-scoped record in it decides:
+   *  an older one is only reported when no newer record follows it here. */
+  observe(events: readonly TranscriptEvent[]): ModelFallbackObservation | null {
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
+    let servingModel: string | undefined;
+    for (const ev of events) {
+      const rec = parseClaudeModelFallbackEvent(ev);
+      if (rec) {
+        if (rec.scope === 'local') continue;
+        // Replies written BEFORE the switch say nothing about what serves now;
+        // shipping one alongside the switch would make the daemon clear the
+        // notice the instant it appeared. That holds whether or not the record
+        // is new to us, so the reset comes BEFORE the uuid dedupe: a re-drain
+        // from offset 0 (a jsonl switch, a baseline self-heal) replays the
+        // switch together with every reply that preceded it, and skipping the
+        // reset would let one of those older replies reach the daemon as
+        // "Claude answered on a different model".
+        servingModel = undefined;
+        if (this.seenUuids.has(rec.uuid)) {
+          // Already reported — but it is still the record that DECIDES, so an
+          // OLDER one earlier in the same batch must not outlive it. A drain
+          // from offset 0 (a jsonl switch, a truncation re-read) replays the
+          // whole file, and the older record is unseen whenever it predates
+          // this worker's baseline: without this reset the batch would report
+          // it and resurrect a notice the newest record already retired.
+          fallback = undefined;
+          continue;
+        }
+        this.acceptSwitch(rec.uuid);
+        fallback = noticeFromSessionRecord(rec);
+        continue;
+      }
+      const serving = servingModelFromAssistantEvent(ev);
+      if (serving) servingModel = serving;
+    }
+    return this.report(fallback, servingModel);
+  }
+
+  /** Bind to `claudeSessionId` and report what the transcript tail can show
+   *  (see {@link readLatestClaudeModelFallback}).
+   *
+   *  ALWAYS returns an observation, even when the scan found nothing at all.
+   *  The empty one is not a claim that the daemon's notice is stale — it is the
+   *  worker declaring WHICH Claude session it is now bridging, which is the
+   *  only way state left over from a different one can be dropped. The daemon
+   *  ignores an empty message whose `claudeSessionId` matches what it holds, so
+   *  a plain worker restart still costs nothing. */
+  seed(path: string, claudeSessionId: string): ModelFallbackObservation {
+    this.bind(claudeSessionId);
+    const seeded = readLatestClaudeModelFallback(path);
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
+    if (seeded.fallback === null) {
+      // No uuid to dedupe on, and none needed: re-sending the same "no notice"
+      // is a no-op at the daemon (it lands on the state it already holds).
+      fallback = null;
+    } else if (seeded.fallback && !this.seenUuids.has(seeded.fallback.uuid)) {
+      this.acceptSwitch(seeded.fallback.uuid);
+      fallback = seeded.fallback;
+    }
+    return this.report(fallback, seeded.servingModel)
+      ?? { claudeSessionId: this.claudeSessionId };
+  }
+
+  /** Take a session-scoped switch record we had not seen before.
+   *
+   *  Resetting `reportedServingModel` here is what keeps a switch BACK visible:
+   *  one drain can carry the whole story (fall off Fable → an Opus reply → the
+   *  user switches back → a Fable reply). Without the reset the batch's closing
+   *  Fable equals the model reported before the fall, gets deduped as
+   *  "unchanged", and the daemon receives the fallback with no clearing
+   *  evidence — a notice that hangs forever. The first serving model observed
+   *  after a switch must always ship, even when its value is old news. */
+  private acceptSwitch(uuid: string): void {
+    this.rememberUuid(uuid);
+    this.reportedServingModel = undefined;
+  }
+
+  private report(
+    fallback: ClaudeModelFallbackRecord | null | undefined,
+    servingModel: string | undefined,
+  ): ModelFallbackObservation | null {
+    const normalized = normalizeClaudeModelId(servingModel);
+    const servingChanged = normalized !== undefined && normalized !== this.reportedServingModel;
+    if (servingChanged) this.reportedServingModel = normalized;
+    if (fallback === undefined && !servingChanged) return null;
+    return {
+      claudeSessionId: this.claudeSessionId,
+      ...(fallback !== undefined
+        ? { fallback: fallback === null ? null : modelFallbackStateOf(fallback) }
+        : {}),
+      ...(servingChanged && servingModel ? { servingModel } : {}),
+    };
+  }
+
+  private rememberUuid(uuid: string): void {
+    this.seenUuids.add(uuid);
+    if (this.seenUuids.size > MODEL_FALLBACK_SEEN_UUIDS_MAX) {
+      const oldest = this.seenUuids.values().next().value;
+      if (oldest !== undefined) this.seenUuids.delete(oldest);
+    }
+  }
+}
+
+/** Provider-neutral terminal semantics derived from one Claude transcript
+ * event. The classifier is deliberately fail-closed: an `unknown` API error is
+ * retryable only when its bounded text matches a verified transient signature. */
+export type ClaudeTerminalOutcome =
+  | { status: 'completed' }
+  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | { status: 'ambiguous'; errorCode: string; retryable: false }
+  | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
+
+function normalizedApiErrorCode(ev: TranscriptEvent): string {
+  return String(ev.error ?? '').trim().toLowerCase();
+}
+
+function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
+  return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Model placeholder Claude Code writes on assistant records no model produced. */
+export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
+
+/**
+ * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
+ * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
+ * bridge resume of a turn that was cut mid-flight):
+ *
+ *     {"type":"assistant","isApiErrorMessage":false,
+ *      "message":{"model":"<synthetic>","stop_reason":"stop_sequence",
+ *                 "content":[{"type":"text","text":"No response requested."}],
+ *                 "usage":{"input_tokens":0,"output_tokens":0,...}}}
+ *
+ * It is always preceded (same timestamp) by an `isMeta` user record
+ * "Continue from where you left off.", and it carries no `requestId`.
+ *
+ * Such a record has every attribute the queue reads as "the model's final
+ * answer" — visible text block, terminal `stop_reason`, not an API error — but
+ * the user's message was never answered. Treating it as `completed` closes the
+ * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
+ * them directly after a Lark-delivered user message, none surfaced anywhere).
+ * Only `message.model` distinguishes it from a real reply.
+ */
+export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
+export function classifyClaudeTerminalEvent(
+  ev: TranscriptEvent,
+): ClaudeTerminalOutcome | undefined {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (isTranscriptRateLimitEvent(ev)) {
+    return {
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    };
+  }
+  if (ev.isApiErrorMessage === true) {
+    const code = normalizedApiErrorCode(ev);
+    const status = ev.apiErrorStatus;
+    if (code.includes('auth') || status === 401 || status === 407) {
+      return { status: 'failed', errorCode: 'provider_authentication_failed', retryable: false };
+    }
+    if (code.includes('permission') || code.includes('authorization') || status === 403) {
+      return { status: 'failed', errorCode: 'provider_permission_denied', retryable: false };
+    }
+    if (code.includes('invalid') || code.includes('terms')
+      || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
+    }
+    if (code.includes('cancel')) {
+      return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
+    }
+    if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
+      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+    }
+    if (code === 'server_error'
+      || (typeof status === 'number' && status >= 500 && status <= 599)
+      || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
+      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+    }
+    return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
+  }
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  // No model call happened, so nothing was answered; the input is still intact
+  // in the transcript, so a continuation can pick it up. `provider_` prefix on
+  // purpose: the daemon routes Claude execution failures (Wait-Mode settle,
+  // async sink, failure card) on that prefix, and the retry offer stays
+  // `caveated` — the cut turn may have run tools before it was resumed.
+  if (isSyntheticNoModelReplyEvent(ev)) {
+    return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
+  }
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return undefined;
+  const reason = ev.message?.stop_reason;
+  if (typeof reason !== 'string' || reason.length === 0
+    || reason === 'tool_use' || reason === 'pause_turn') return undefined;
+  return { status: 'completed' };
+}
+
+/**
+ * Authoritative Claude Code end-of-turn markers observed in its JSONL:
+ *
+ * - the final non-sidechain assistant message carries a non-tool stop reason;
+ * - current Claude versions additionally append `system/turn_duration`.
+ *
+ * Both may be present for the same turn, so consumers must deduplicate by the
+ * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
+ * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ */
+export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  const reason = ev.message?.stop_reason;
+  return typeof reason === 'string'
+    && reason.length > 0
+    && reason !== 'tool_use'
+    && reason !== 'pause_turn';
+}
+
+/** The launch-ack a background Agent/Task tool_result carries the moment it is
+ *  dispatched: the tool call returns immediately with "launched"/"in the
+ *  background" text and an `agentId:` line, and the real result only arrives
+ *  later as a re-injected `<task-notification>`. Anchored on both markers so an
+ *  ordinary synchronous tool_result that merely mentions "background" is not
+ *  mistaken for an async dispatch. */
+const BACKGROUND_LAUNCH_ACK_RE = /launched|in the background/i;
+const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
+
+/** Identify a background Agent/Task dispatch from an assistant event: returns
+ *  the tool_use ids that dispatched async work. Empty when the event dispatched
+ *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
+ *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
+export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && (block.name === 'Agent' || block.name === 'Task')) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Read a background launch-ack out of a user event's tool_result blocks. Maps
+ *  each async-dispatch tool_use_id to the durable agent id minted in its ack
+ *  text (the id `<task-notification>` later reports under `<task-id>`). Only
+ *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
+ *  line qualify, so a synchronous tool result is never counted. */
+export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; agentId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    if (!BACKGROUND_LAUNCH_ACK_RE.test(text)) continue;
+    const m = BACKGROUND_LAUNCH_AGENT_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, agentId: m[1] });
+  }
+  return acks;
+}
+
+/** A `<task-notification>` re-injected when a background agent stops. It is a
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
+ *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
+ *  `status` is the agent's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
+  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  if (!taskId) return undefined;
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
+  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+}
+
+/** Live count of background Agent/Task dispatches whose completion notification
+ *  has not yet arrived, folded from a transcript event stream. The worker keeps
+ *  one per session and consults `pending()` at the PTY idle edge: while a main
+ *  turn is only idle because it is awaiting a background sub-agent, the session
+ *  card must stay `working` rather than freezing to idle (which Lark surfaces as
+ *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
+ *  duplicate notification or a re-drained dispatch cannot double-count. */
+export class BackgroundTaskTracker {
+  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
+  private readonly live = new Map<string, string>();
+  /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
+  private readonly ackByToolUse = new Map<string, string>();
+  /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
+  private readonly awaitingAck = new Set<string>();
+
+  observe(ev: TranscriptEvent): void {
+    // A genuine user-typed prompt starts a new turn and supersedes any prior
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
+      this.reset();
+      return;
+    }
+    for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
+      const agentId = this.ackByToolUse.get(toolUseId);
+      if (agentId) this.live.set(agentId, toolUseId);
+      else this.awaitingAck.add(toolUseId);
+    }
+    for (const ack of backgroundTaskDispatchAcks(ev)) {
+      this.ackByToolUse.set(ack.toolUseId, ack.agentId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+    }
+    const note = parseTaskNotification(ev);
+    if (note) this.live.delete(note.taskId);
+  }
+
+  /** Number of background agents still in flight. */
+  pending(): number {
+    return this.live.size;
+  }
+
+  reset(): void {
+    this.live.clear();
+    this.ackByToolUse.clear();
+    this.awaitingAck.clear();
+  }
+}
+
+/** Extract the user-typed prompt text for a "turn start" event — works for
+ *  both legacy `role:user` events (text in `message.content`) and the
+ *  type-ahead `attachment(queued_command)` form (text in `attachment.prompt`).
+ *  Returns '' when neither shape carries usable content. Used at three
+ *  layers: BridgeTurnQueue.ingest (fingerprint-match the right pending Lark
+ *  turn), worker emit (local-turn user-text resolution), and tests. */
+export function extractTurnStartText(ev: TranscriptEvent | null | undefined): string {
+  if (!ev || typeof ev !== 'object') return '';
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    if (typeof prompt === 'string') return prompt;
+    return stringifyUserContent(prompt);
+  }
+  return stringifyUserContent(ev.message?.content);
+}
+
+export interface DrainResult {
+  events: TranscriptEvent[];
+  /** Byte offset to pass back on the next drain. */
+  newOffset: number;
+  /** Trailing partial line (no newline yet) — kept so the next drain can
+   *  prepend it. Internal helper for chained drains; callers usually only
+   *  need to remember `newOffset`. */
+  pendingTail: string;
+}
+
+/**
+ * Read everything from `path` starting at `fromOffset` and return parsed
+ * JSONL events plus the new file offset.
+ *
+ * - Returns `{ events: [], newOffset: 0, pendingTail: '' }` if the file
+ *   doesn't exist (caller treats this as "nothing yet").
+ * - Detects truncation (size < fromOffset): resets to 0 and re-drains so a
+ *   rotated/cleared transcript doesn't silently swallow new lines.
+ * - Skips malformed JSON lines (logs nothing — robustness over noise).
+ * - The trailing partial line (no `\n` yet) is *not* parsed and *not*
+ *   counted toward `newOffset`, so the next drain re-reads it.
+ */
+export function drainTranscript(
+  path: string,
+  fromOffset: number,
+): DrainResult {
+  if (!existsSync(path)) {
+    return { events: [], newOffset: 0, pendingTail: '' };
+  }
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return { events: [], newOffset: fromOffset, pendingTail: '' };
+  }
+  let start = fromOffset;
+  if (size < start) {
+    // Truncated/rotated — re-read from the top.
+    start = 0;
+  }
+  if (size === start) {
+    return { events: [], newOffset: start, pendingTail: '' };
+  }
+  const len = size - start;
+  const buf = Buffer.alloc(len);
+  let read = 0;
+  const fd = openSync(path, 'r');
+  try {
+    read = readSync(fd, buf, 0, len, start);
+  } finally {
+    closeSync(fd);
+  }
+  const text = buf.subarray(0, read).toString('utf8');
+
+  // Find the last '\n' — anything after it is a partial line we shouldn't
+  // commit yet. Adjust newOffset to exclude the partial tail so the next
+  // drain re-reads it.
+  const lastNl = text.lastIndexOf('\n');
+  let toParse: string;
+  let pendingTail: string;
+  let newOffset: number;
+  if (lastNl < 0) {
+    // No complete line at all — treat the whole buffer as pending.
+    toParse = '';
+    pendingTail = text;
+    newOffset = start;
+  } else {
+    toParse = text.substring(0, lastNl);
+    pendingTail = text.substring(lastNl + 1);
+    newOffset = start + Buffer.byteLength(text.substring(0, lastNl + 1), 'utf8');
+  }
+
+  const events: TranscriptEvent[] = [];
+  if (toParse) {
+    for (const line of toParse.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
+      } catch {
+        // Malformed line — skip silently. Claude Code's writer is atomic per
+        // line, so this means a debug/non-JSON line snuck in; not our concern.
+      }
+    }
+  }
+  return { events, newOffset, pendingTail };
+}
+
+/**
+ * Filter to assistant text events. Returns only events where:
+ *   - type === 'assistant' OR message.role === 'assistant'
+ *   - content has at least one text block
+ *   - uuid is present
+ *
+ * Sub-agent / sidechain events (isSidechain === true) are excluded so that
+ * spawn-internal Task agent chatter doesn't leak to Lark.
+ */
+export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEvent[] {
+  return events.filter(e => {
+    if (!e || typeof e !== 'object') return false;
+    if ((e as any).isSidechain === true) return false;
+    // API-error lines are execution metadata rather than assistant answers.
+    // The bridge emits a structured terminal outcome (or the existing limited
+    // state) and daemon-owned recovery/attention provides user visibility.
+    if (e.isApiErrorMessage === true || isTranscriptRateLimitEvent(e)) return false;
+    const role = e.message?.role ?? e.type;
+    if (role !== 'assistant') return false;
+    if (!e.uuid) return false;
+    const content = e.message?.content;
+    if (!content) return false;
+    if (typeof content === 'string') return content.length > 0;
+    if (Array.isArray(content)) return content.some(b => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0);
+    return false;
+  });
+}
+
+/**
+ * Extract the visible text from one assistant event. Walks all `type:'text'`
+ * blocks in `message.content` (or the bare string) and joins them with
+ * blank lines. Returns '' if no text blocks.
+ */
+export function extractAssistantText(event: TranscriptEvent): string {
+  const content = event.message?.content;
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+/**
+ * Extract the model's thinking (CoT) text from one assistant event. Walks all
+ * `type:'thinking'` blocks in `message.content` and joins them with blank
+ * lines. Returns '' when the event carries no thinking blocks. Sidechain /
+ * error filtering is the caller's job (bridge-turn-queue already applies it
+ * before attribution).
+ */
+export function extractAssistantThinking(event: TranscriptEvent): string {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block && (block as any).type === 'thinking' && typeof (block as any).thinking === 'string' && (block as any).thinking.length > 0) {
+      parts.push((block as any).thinking);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+/** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
+ *  contents, long prompts) and results (file reads, command output) can be
+ *  hundreds of KB — the bubble only needs a recognisable preview.
+ *  args 截断不再影响气泡标题：标题用的 `subject` 在截断之前从完整 input 上
+ *  单独提取（见 extractCotEntries）。 */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts —
+ *  redeclared structurally here to keep this module dependency-free. */
+export type TranscriptCotEntry =
+  | { kind: 'thinking'; text: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
+    subject?: string;
+  }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Flatten a tool_result block's content (string, or array of text blocks)
+ *  to a display string. Non-text blocks (images) are skipped. */
+function stringifyToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n');
+}
+
+/**
+ * Extract the CoT (thinking process) entries from one transcript event, in
+ * content-block order:
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
+ *   - user events → `tool_result` blocks (tool_use_id + flattened text,
+ *     truncated).
+ * Returns [] for events carrying neither. Sidechain / error filtering is the
+ * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
+ */
+export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return [];
+  const entries: TranscriptCotEntry[] = [];
+  for (const block of content as any[]) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
+      entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
+    } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
+      const subject = boundSubjectForTransport(subjectFromInputObject(block.input));
+      let args = '';
+      try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+        ...(subject ? { subject } : {}),
+      });
+    } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+      const result = stringifyToolResultContent(block.content);
+      entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });
+    }
+  }
+  return entries;
+}
+
+/** Convenience: filter+extract a list of events into a single concatenated string. */
+export function joinAssistantText(events: TranscriptEvent[]): string {
+  return pickAssistantTextEvents(events)
+    .map(extractAssistantText)
+    .filter(s => s.length > 0)
+    .join('\n\n');
+}
+
+function hasToolUseBlock(ev: TranscriptEvent): boolean {
+  const content = ev.message?.content;
+  return Array.isArray(content) && content.some(b => b && (b as any).type === 'tool_use');
+}
+
+/**
+ * The turn's FINAL answer: the contiguous run of this turn's assistant-text
+ * events after its last tool_use. A long agentic turn writes many interim
+ * narration blocks between tool calls; joining them all (joinAssistantText)
+ * makes the fallback both post a narration collage AND look "materially
+ * longer" than the model's own explicit `botmux send`, defeating the
+ * bridge-fallback gate. Walking back from the turn's last text event until a
+ * tool_use / tool_result boundary yields just the closing answer.
+ *
+ * Crossed (not boundaries): thinking-only assistant lines and non-message
+ * meta lines (`last-prompt`, `ai-title`, system, attachments) — Claude Code
+ * interleaves these freely inside a closing answer. Events from other turns
+ * never contribute: only uuids in `turnAssistantUuids` are collected.
+ * Returns '' for a turn with no text after its last tool_use (nothing worth
+ * falling back with — e.g. the turn ended in a `botmux send` call).
+ */
+export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+  if (turnAssistantUuids.length === 0) return '';
+  const uuids = new Set(turnAssistantUuids);
+  const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
+  let end = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]?.uuid === lastUuid) { end = i; break; }
+  }
+  if (end === -1) return '';
+  // The turn must actually END in text: if an assistant tool_use line follows
+  // the last text event (before any real next-turn user message), the turn
+  // closed mid-tooling — there is no final answer to fall back with.
+  for (let i = end + 1; i < events.length; i++) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    if (role === 'assistant' && hasToolUseBlock(ev)) return '';
+    if (role === 'user' && isMeaningfulUserEvent(ev)) break;
+  }
+  const tail: TranscriptEvent[] = [];
+  for (let i = end; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    if (role === 'assistant') {
+      if (hasToolUseBlock(ev)) break;
+      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      // Thinking-only / non-turn assistant lines: cross unless they belong to
+      // a DIFFERENT turn's visible text (then we've walked past our turn).
+      if (pickAssistantTextEvents([ev]).length > 0) break;
+      continue;
+    }
+    if (role === 'user') break;
+    // system / attachment / meta lines (last-prompt, ai-title, …): cross.
+  }
+  return joinAssistantText(tail);
+}
+
+/** XML wrappers Claude Code uses for synthetic user events that aren't real
+ *  prompts (slash command invocation, local-command output caveat, etc.).
+ *  These should usually carry `isMeta:true` and we'd filter on that — this
+ *  list is a defense-in-depth check for jsonls where the flag is absent. */
+const SYNTHETIC_USER_PREFIXES = [
+  '<command-name>',
+  '<command-message>',
+  '<command-args>',
+  '<local-command-caveat>',
+  '<local-command-stdout>',
+  '<local-command-stderr>',
+  '<task-notification>',
+];
+
+/** True when a `type:'user'` (or `message.role:'user'`) event represents a
+ *  *real* prompt the human typed — not Claude Code's internal machinery
+ *  (tool_result, slash-command wrappers, isMeta/isCompactSummary markers,
+ *  sidechain spawn events). The bridge attribution queue and the adopt
+ *  preamble extractor share this predicate to ensure they're seeing the
+ *  same notion of "user input". */
+export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  const flags = ev as any;
+  if (flags.isMeta === true) return false;
+  if (flags.isCompactSummary === true) return false;
+  if (flags.isSidechain === true) return false;
+  const content = ev.message?.content;
+  if (isPureToolResultUserEvent(content)) return false;
+  const text = normaliseForFingerprint(stringifyUserContent(content));
+  if (text.length === 0) return false;
+  if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+/** True when a `type:'attachment'` line carries a queued-command payload
+ *  representing a real submitted prompt. Claude writes one of these when it
+ *  dequeues a type-ahead submission (right before the assistant's reply for
+ *  that turn starts streaming) — the bridge attribution queue treats it
+ *  exactly like a `role:user` event for turn-start purposes. Filters mirror
+ *  isMeaningfulUserEvent's defenses (sidechain, empty / synthetic-prefix
+ *  prompts) so a queued slash command can't false-start a Lark turn. */
+export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.type !== 'attachment') return false;
+  if (ev.attachment?.type !== 'queued_command') return false;
+  if (ev.attachment.commandMode === 'task-notification') return false;
+  if ((ev as any).isSidechain === true) return false;
+  const text = normaliseForFingerprint(extractTurnStartText(ev));
+  if (text.length === 0) return false;
+  if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+export interface AdoptPreamble {
+  /** The most recent meaningful user prompt's text (post-stringify, no
+   *  whitespace collapse — preserves the prompt's actual formatting). */
+  userText: string;
+  /** All assistant visible-text emitted between that user prompt and the
+   *  end of the events list, joined with blank lines. tool_use blocks are
+   *  excluded; sidechain assistant events are excluded. */
+  assistantText: string;
+}
+
+/** Walk the events forward and return the last *completed* user/assistant
+ *  exchange. "Completed" here means: a meaningful user prompt followed by
+ *  at least one assistant event with visible text. tool_use / tool_result
+ *  events do NOT reset the turn — they're intra-turn machinery, so a
+ *  prompt → tool_use → tool_result → assistant text sequence still counts
+ *  as a single turn. Returns null when there's no meaningful user yet, or
+ *  the last user wasn't followed by any visible assistant text (Claude is
+ *  mid-tool-use when /adopt fired).
+ *
+ *  Used by adopt-bridge to surface "the previous round" to the Lark thread
+ *  so the user has context for continuing the conversation. */
+export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+  let userText: string | null = null;
+  let assistantTexts: string[] = [];
+
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue;
+    if (isMeaningfulUserEvent(ev)) {
+      // New turn boundary — reset the assistant accumulator.
+      userText = stringifyUserContent(ev.message?.content);
+      assistantTexts = [];
+      continue;
+    }
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'assistant') continue;
+    if ((ev as any).isSidechain === true) continue;
+    const text = extractAssistantText(ev);
+    if (text.length === 0) continue;
+    if (userText !== null) assistantTexts.push(text);
+  }
+
+  if (userText === null || assistantTexts.length === 0) return null;
+  return {
+    userText,
+    assistantText: assistantTexts.join('\n\n'),
+  };
+}
+
+/**
+ * True when a user-role event carries ONLY tool_result blocks — Claude
+ * Code's representation of "tool returned this output" between an
+ * assistant tool_use and the assistant's continuation. Both the bridge
+ * attribution queue and the on-disk fingerprint search must skip these:
+ *
+ *   - the queue would treat tool output as fresh local input and disable
+ *     collection mid-turn,
+ *   - the fingerprint search would false-positive on log content that
+ *     happens to contain the Lark fingerprint substring (e.g. a short
+ *     "hello" message hijacked by an unrelated jsonl whose tool_result
+ *     dumped a log line containing "hello"). Re-exported by
+ *     bridge-turn-queue.ts so both consumers share the same predicate
+ *     and never drift apart.
+ */
+export function isPureToolResultUserEvent(content: unknown): boolean {
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return content.every((block: any) => block?.type === 'tool_result');
+}
+
+/**
+ * Stringify a transcript user event's content to a flat string. Handles
+ * both legacy bare-string content and the array-of-blocks form.
+ *
+ * Lives here (not in bridge-turn-queue.ts) so the in-process attribution
+ * state machine and the on-disk fingerprint search use *exactly* the
+ * same text — otherwise multi-line / array-content Lark messages stop
+ * matching one path or the other and bridges silently break.
+ */
+export function stringifyUserContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content as any[]) {
+    if (typeof block?.text === 'string') parts.push(block.text);
+    else if (typeof block?.content === 'string') parts.push(block.content);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Collapse whitespace + trim. Same normalisation applied on both sides
+ * of the fingerprint compare (the Lark message that produces the
+ * fingerprint, and the transcript user content we search through),
+ * so newlines / tabs / double-spaces don't break the match.
+ */
+export function normaliseForFingerprint(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Find the most recently-modified `.jsonl` file in a Claude Code project
+ * directory.
+ *
+ * `acceptCandidate` lets callers narrow the candidate set — the bridge's
+ * quiet-mtime fallback passes a trust-set predicate so a sibling Claude
+ * pane writing in the same project dir cannot hijack the watcher.
+ * Without it any actively-written sibling jsonl wins the mtime race and
+ * the bridge enters a flap loop with the pid resolver pulling it back.
+ *
+ * Returns null when the directory doesn't exist, has no jsonl files, or
+ * every candidate was rejected by `acceptCandidate`.
+ */
+export function findLatestJsonl(
+  dir: string,
+  opts?: { acceptCandidate?: (path: string) => boolean },
+): string | null {
+  if (!existsSync(dir)) return null;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  const accept = opts?.acceptCandidate;
+  let latestPath: string | null = null;
+  let latestMtime = -Infinity;
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    if (accept && !accept(full)) continue;
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (st.mtimeMs > latestMtime) {
+        latestMtime = st.mtimeMs;
+        latestPath = full;
+      }
+    } catch {
+      // File disappeared between readdir and stat — ignore.
+    }
+  }
+  return latestPath;
+}
+
+/**
+ * Search every `.jsonl` file in `dir` for one whose contents include the
+ * given fingerprint. Used by the bridge watcher to detect a session
+ * switch (`/clear` / `/resume`) caused by the user's pane: when a Lark
+ * message is pending and its content fingerprint shows up in a NEW jsonl
+ * file, that file is the user's current session and we should switch.
+ *
+ * Pinning the switch decision to fingerprint match (rather than mtime)
+ * avoids hijacking by sibling Claude Code panes in the same project
+ * directory — they'll write busy jsonls but won't ever contain our Lark
+ * fingerprint.
+ *
+ * Optional `excludePath` skips the file we're already watching so the
+ * caller's "did it change?" comparison is cheap.
+ *
+ * Reads only the trailing 1 MB of each candidate (fingerprints land near
+ * the end of the jsonl when Claude has just written them) — long-lived
+ * sessions can grow to tens of MB so a full read would be wasteful.
+ * Callers should still gate on "an unstarted pending turn exists" rather
+ * than calling this on every poll tick.
+ */
+export interface JsonlFingerprintSearchOptions {
+  /** Skip the file the caller is already watching/checking. */
+  excludePath?: string;
+  /** Ignore older files when the caller is looking for a just-written submit. */
+  minMtimeMs?: number;
+  /** Drop events whose `timestamp` field is older than this (millis since
+   *  epoch). Defends against short fingerprints ("hello", "test") matching
+   *  old user lines in unrelated sibling jsonls — file mtime alone isn't
+   *  enough since a sibling Claude pane could be actively writing. */
+  minEventTimestampMs?: number;
+  /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
+  includeQueueOperations?: boolean;
+  /** Called on each candidate that already passed the fingerprint match.
+   *  Returning `false` skips the candidate and continues searching older
+   *  files in the directory (mtime-descending walk). Used by the bridge
+   *  watcher to reject sibling-pane jsonls whose sessionId we don't trust,
+   *  without losing the chance to find a legitimate /clear rotation buried
+   *  under a busier sibling. Default (no callback): accept the first
+   *  fingerprint match like the original behaviour. */
+  acceptCandidate?: (path: string) => boolean;
+}
+
+/** Scan a single jsonl file's tail for a Lark message fingerprint. Same
+ *  parsing rules as `findJsonlContainingFingerprint` (decode role:user content,
+ *  optionally also queue-operation/enqueue, normalise whitespace, then
+ *  substring-match the fingerprint). Used by the claude-code adapter when
+ *  the pid resolver has just switched to a rotated jsonl that may already
+ *  contain the just-submitted user event. */
+export function jsonlContainsFingerprint(
+  path: string,
+  fingerprint: string,
+  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
+): boolean {
+  if (fingerprint.length === 0 || !existsSync(path)) return false;
+  let size: number;
+  try { size = statSync(path).size; } catch { return false; }
+  if (size === 0) return false;
+  const includeQueueOps = opts?.includeQueueOperations ?? false;
+  const minEventTimestampMs = opts?.minEventTimestampMs;
+  const len = Math.min(size, 1024 * 1024);
+  let buf: Buffer;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  const text = buf.toString('utf8');
+  const lines = text.split('\n');
+  // Skip the leading partial line when we read a strict tail (size > len).
+  const startIdx = size > len ? 1 : 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let ev: any;
+    try { ev = JSON.parse(line); } catch { continue; }
+    if (!ev || typeof ev !== 'object') continue;
+    // Per-event timestamp guard: short fingerprints would otherwise
+    // false-match old user events in unrelated sibling jsonls (file
+    // mtime can be recent if a sibling Claude pane is actively writing
+    // its own turns). We compare against `event.timestamp` rather than
+    // file mtime to be precise.
+    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+      const evMs = Date.parse(ev.timestamp);
+      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
+    }
+    const role = ev.message?.role ?? ev.type;
+    let lineText = '';
+    if (role === 'user') {
+      // Skip pure tool_result events — Claude Code records them as
+      // role:user but they're internal turn machinery, not the user's
+      // actual prompt. A tool_result that dumps log output containing
+      // the fingerprint substring would otherwise hijack the search.
+      if (isPureToolResultUserEvent(ev.message?.content)) continue;
+      lineText = stringifyUserContent(ev.message?.content);
+    } else if (
+      includeQueueOps &&
+      ev.type === 'queue-operation' &&
+      ev.operation === 'enqueue'
+    ) {
+      lineText = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+    } else {
+      continue;
+    }
+    const normalisedText = normaliseForFingerprint(lineText);
+    if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return true;
+  }
+  return false;
+}
+
+export function findJsonlContainingFingerprint(
+  dir: string,
+  fingerprint: string,
+  excludePathOrOptions?: string | JsonlFingerprintSearchOptions,
+): string | null {
+  if (!existsSync(dir) || fingerprint.length === 0) return null;
+  const opts: JsonlFingerprintSearchOptions =
+    typeof excludePathOrOptions === 'string'
+      ? { excludePath: excludePathOrOptions }
+      : (excludePathOrOptions ?? {});
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  // Walk newest-first so a recently-rotated jsonl is found before older
+  // ones; if two files contain the fingerprint (rare, e.g. user pasted
+  // the same message into two panes) we prefer the more recent.
+  const candidates: Array<{ path: string; mtime: number }> = [];
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    if (opts.excludePath && full === opts.excludePath) continue;
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
+      candidates.push({ path: full, mtime: st.mtimeMs });
+    } catch { /* ignore */ }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const { path } of candidates) {
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        const size = statSync(path).size;
+        // Read at most the trailing 1MB — fingerprints land near the end
+        // of the jsonl when Claude just wrote them. Cheaper than reading
+        // an entire long-lived session.
+        const len = Math.min(size, 1024 * 1024);
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        const text = buf.toString('utf8');
+        // We must NOT do a raw includes() here: Claude writes user content
+        // as a JSON-encoded string, so any newline in the Lark message is
+        // serialized as `\n` on disk while our fingerprint has it
+        // collapsed to a single space. Parse each complete jsonl line,
+        // pick role:user events, and apply the same stringify+normalise
+        // we use in BridgeTurnQueue.ingest. Skip the leading partial line
+        // when we read a strict tail (size > len), since it likely begins
+        // mid-line.
+        const lines = text.split('\n');
+        const startIdx = size > len ? 1 : 0;
+        for (let i = startIdx; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (!ev || typeof ev !== 'object') continue;
+          // Per-event timestamp guard — see jsonlContainsFingerprint for
+          // the full rationale. Required to keep short fingerprints
+          // ("hello", "test") from matching old user lines in unrelated
+          // sibling jsonls.
+          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+            const evMs = Date.parse(ev.timestamp);
+            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
+          }
+          const role = ev.message?.role ?? ev.type;
+          let text = '';
+          if (role === 'user') {
+            // Skip pure tool_result events — see jsonlContainsFingerprint
+            // for the full rationale; in short, tool_result content is
+            // log output, not user input, and would false-match short
+            // fingerprints like "hello" in unrelated jsonls.
+            if (isPureToolResultUserEvent(ev.message?.content)) continue;
+            text = stringifyUserContent(ev.message?.content);
+          } else if (
+            opts.includeQueueOperations &&
+            ev.type === 'queue-operation' &&
+            ev.operation === 'enqueue'
+          ) {
+            text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+          } else {
+            continue;
+          }
+          const normalisedText = normaliseForFingerprint(text);
+          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+            // Allow caller to veto this candidate (e.g., sibling-pane
+            // hijack guard rejecting an untrusted sessionId). On veto,
+            // break out of the line loop so we move to the next, older
+            // candidate instead of returning `null` after the first
+            // fingerprint hit.
+            if (opts.acceptCandidate && !opts.acceptCandidate(path)) {
+              break;
+            }
+            return path;
+          }
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch { /* unreadable — skip */ }
+  }
+  return null;
+}
+
+/**
+ * Stronger sibling-pane recovery anchor than the substring fingerprint
+ * search. Walks every `.jsonl` in `dir` and returns the paths whose
+ * trailing 1MB contains a user/queue event whose normalised text is
+ * EXACTLY equal to `normalisedContent` (not a substring), respecting
+ * `excludePath`, `minMtimeMs`, `minEventTimestampMs`,
+ * `includeQueueOperations`, and `acceptCandidate` the same way as
+ * `findJsonlContainingFingerprint`.
+ *
+ * Returns *all* matches in mtime-descending order — callers must
+ * abstain when the result has length > 1, since multiple files containing
+ * the same exact normalised content cannot be disambiguated without
+ * stronger evidence (and forcing a switch would risk picking the wrong
+ * pane). The caller's typical pattern is:
+ *
+ *   - 1 match → switch to it (legitimate post-/clear recovery)
+ *   - 0 matches → no recovery this tick; wait for stronger signal
+ *   - >1 match → log and abstain; surface a diagnostic to the user
+ *
+ * Used by the bridge fingerprint fallback's recovery path for in-pane
+ * `/clear`: substring matches risk hijacking on short fingerprints (the
+ * literal text "test" matches "run tests" / "test bridge"), but full
+ * equality on a Lark message we just wrote is a much stronger anchor.
+ */
+export function findJsonlsContainingExactContent(
+  dir: string,
+  normalisedContent: string,
+  options?: JsonlFingerprintSearchOptions,
+): string[] {
+  if (!existsSync(dir) || normalisedContent.length === 0) return [];
+  const opts: JsonlFingerprintSearchOptions = options ?? {};
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const candidates: Array<{ path: string; mtime: number }> = [];
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = join(dir, name);
+    if (opts.excludePath && full === opts.excludePath) continue;
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
+      candidates.push({ path: full, mtime: st.mtimeMs });
+    } catch { /* ignore */ }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const matches: string[] = [];
+  for (const { path } of candidates) {
+    if (opts.acceptCandidate && !opts.acceptCandidate(path)) continue;
+    try {
+      const fd = openSync(path, 'r');
+      try {
+        const size = statSync(path).size;
+        const len = Math.min(size, 1024 * 1024);
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        const text = buf.toString('utf8');
+        const lines = text.split('\n');
+        const startIdx = size > len ? 1 : 0;
+        let hit = false;
+        for (let i = startIdx; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (!ev || typeof ev !== 'object') continue;
+          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+            const evMs = Date.parse(ev.timestamp);
+            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
+          }
+          const role = ev.message?.role ?? ev.type;
+          let raw = '';
+          if (role === 'user') {
+            if (isPureToolResultUserEvent(ev.message?.content)) continue;
+            raw = stringifyUserContent(ev.message?.content);
+          } else if (
+            opts.includeQueueOperations &&
+            ev.type === 'queue-operation' &&
+            ev.operation === 'enqueue'
+          ) {
+            raw = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+          } else {
+            continue;
+          }
+          const normalised = normaliseForFingerprint(raw);
+          if (normalised === normalisedContent) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit) matches.push(path);
+      } finally {
+        closeSync(fd);
+      }
+    } catch { /* unreadable — skip */ }
+  }
+  return matches;
+}
+
+/**
+ * Partition transcript events into history (timestamp ≤ cutoff) and live
+ * (timestamp > cutoff, or no parseable timestamp). Used by the bridge
+ * watcher when it switches to a new jsonl that may contain pre-existing
+ * conversation: anything older than the cutoff (e.g. iTerm-typed turns
+ * the user produced before the Lark mark fired) belongs in the seen-set
+ * via `BridgeTurnQueue.absorb` so the worker doesn't replay them as
+ * "🖥️ 终端本地对话" cards. Anything newer is fed through `ingest()` so
+ * the freshly-written Lark user event can match its pending fingerprint.
+ *
+ * Events with malformed / missing timestamps fall into `live`: better
+ * to forward an unattributable event once than to silently drop a real
+ * reply because Claude omitted a timestamp.
+ */
+export function splitTranscriptEventsByCutoff(
+  events: TranscriptEvent[],
+  cutoffMs: number,
+): { history: TranscriptEvent[]; live: TranscriptEvent[] } {
+  const history: TranscriptEvent[] = [];
+  const live: TranscriptEvent[] = [];
+  for (const ev of events) {
+    let evMs = Number.NaN;
+    if (typeof ev.timestamp === 'string') evMs = Date.parse(ev.timestamp);
+    if (Number.isFinite(evMs) && evMs <= cutoffMs) history.push(ev);
+    else live.push(ev);
+  }
+  return { history, live };
+}
+
+/**
+ * Read the first event timestamp out of a jsonl. Reads only the leading
+ * 4 KB — Claude's `file-history-snapshot` and `SessionStart` events both
+ * land in the first few hundred bytes. Returns the parsed millis, or
+ * undefined when no parseable timestamp is found in the leading chunk
+ * (corrupted file, partial first line, format change).
+ *
+ * NOTE: not currently wired into the bridge rotation flow. The bridge
+ * fingerprint fallback (`decideFingerprintSwitch` in
+ * `bridge-rotation-policy.ts`) deliberately rejects candidates outside
+ * the pid-derived trust set rather than relying on freshness heuristics
+ * — file-creation timestamps cannot prove ownership across panes in
+ * the same project dir. Kept here as a reusable primitive for
+ * diagnostics and future /clear-recovery work.
+ */
+export function readFirstEventTimestamp(path: string): number | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch {
+    return undefined;
+  }
+  try {
+    const len = 4096;
+    const buf = Buffer.alloc(len);
+    let bytesRead = 0;
+    try {
+      bytesRead = readSync(fd, buf, 0, len, 0);
+    } catch {
+      return undefined;
+    }
+    if (bytesRead <= 0) return undefined;
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    const lines = text.split('\n');
+    // Drop the trailing partial line if we read exactly `len` bytes — it
+    // may not be a complete JSON object. When the whole file is shorter
+    // than `len` bytes the last line is complete and we keep it.
+    const usable = bytesRead === len ? lines.slice(0, -1) : lines;
+    for (const line of usable) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let ev: any;
+      try { ev = JSON.parse(trimmed); } catch { continue; }
+      // Top-level `timestamp` field — covers both regular events
+      // (user/assistant/attachment) and `file-history-snapshot` records
+      // whose `timestamp` lives under `snapshot.timestamp` instead.
+      const tsStr = typeof ev?.timestamp === 'string'
+        ? ev.timestamp
+        : typeof ev?.snapshot?.timestamp === 'string'
+          ? ev.snapshot.timestamp
+          : undefined;
+      if (!tsStr) continue;
+      const ms = Date.parse(tsStr);
+      if (Number.isFinite(ms)) return ms;
+    }
+    return undefined;
+  } finally {
+    closeSync(fd);
+  }
+}

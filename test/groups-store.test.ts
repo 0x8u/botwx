@@ -1,0 +1,470 @@
+/**
+ * Unit tests for groups-store wrappers (Lark im/v1 chat APIs).
+ *
+ * Run:  pnpm vitest run test/groups-store.test.ts
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// chat.create is configurable per test via this stub so we can test both the
+// happy path and error responses.
+const chatCreateStub = vi.fn();
+// chat.update mocks the owner-transfer call.
+const chatUpdateStub = vi.fn();
+// chat.link mocks the share-link fetch.
+const chatLinkStub = vi.fn();
+let chatListItems: Array<Record<string, unknown>>;
+
+// Mock bot-registry's getBotClient — that's where groups-store imports from.
+// Read-only GETs (listChats / isInChat / getChatOwner) now go through
+// `client.request()` to avoid the empty-GET-body 411; mutating calls
+// (chat.create / chat.update / chatMembers.create) stay on generated methods.
+vi.mock('../src/bot-registry.js', () => ({
+  getBotClient: vi.fn().mockImplementation(() => ({
+    request: vi.fn().mockImplementation(async ({ url }: { url: string }) => {
+      if (url.includes('/members/is_in_chat')) {
+        return { code: 0, data: { is_in_chat: true } };
+      }
+      if (/\/open-apis\/im\/v1\/chats$/.test(url)) {
+        return {
+          code: 0,
+          data: {
+            items: chatListItems,
+            has_more: false,
+          },
+        };
+      }
+      // getChatOwner: GET /open-apis/im/v1/chats/<id>
+      if (/\/open-apis\/im\/v1\/chats\/[^/]+$/.test(url)) {
+        return { code: 0, data: { owner_id: 'ou_owner', name: 'one' } };
+      }
+      throw new Error(`unexpected GET url in mock: ${url}`);
+    }),
+    im: {
+      v1: {
+        chat: {
+          create: chatCreateStub,
+          update: chatUpdateStub,
+          link: chatLinkStub,
+        },
+        chatMembers: {
+          create: vi.fn().mockResolvedValue({
+            code: 0,
+            data: { invalid_id_list: ['cli_X'] },
+          }),
+        },
+        chatManagers: {
+          addManagers: chatManagersAddStub,
+        },
+      },
+    },
+  })),
+}));
+
+const chatManagersAddStub = vi.fn();
+
+import {
+  listChats,
+  isInChat,
+  addBotToChat,
+  createChat,
+  transferChatOwner,
+  addChatManagers,
+  getChatShareLink,
+  renameChat,
+} from '../src/services/groups-store.js';
+
+describe('groups-store wrappers', () => {
+  beforeEach(() => {
+    chatCreateStub.mockClear();
+    chatUpdateStub.mockClear();
+    chatLinkStub.mockReset();
+    chatManagersAddStub.mockReset();
+    chatListItems = [{
+      chat_id: 'c1',
+      name: 'one',
+      description: 'first chat',
+      chat_mode: 'group',
+      chat_status: 'normal',
+      owner_id: 'ou_owner',
+      avatar: 'https://avatar.example/c1.png',
+    }];
+  });
+
+  it('listChats returns ChatBrief array', async () => {
+    const out = await listChats('appA');
+    expect(out).toHaveLength(1);
+    expect(out[0].chatId).toBe('c1');
+    expect(out[0].name).toBe('one');
+    expect(out[0].description).toBe('first chat');
+    expect(out[0].chatMode).toBe('group');
+    expect(out[0].chatStatus).toBe('normal');
+    expect(out[0].ownerId).toBe('ou_owner');
+    expect(out[0].avatar).toBe('https://avatar.example/c1.png');
+  });
+
+  it('listChats only returns chats that Feishu explicitly reports as normal', async () => {
+    chatListItems.push(
+      { chat_id: 'c2', name: 'dissolved', chat_status: 'dissolved' },
+      { chat_id: 'c3', name: 'retained history', chat_status: 'dissolved_save' },
+      { chat_id: 'c4', name: 'unknown legacy state' },
+    );
+
+    await expect(listChats('appA')).resolves.toEqual([
+      expect.objectContaining({ chatId: 'c1', chatStatus: 'normal' }),
+    ]);
+  });
+
+  it('isInChat returns boolean', async () => {
+    expect(await isInChat('appA', 'c1')).toBe(true);
+  });
+
+  it('renameChat reads the current chat then updates its name with the same bot identity', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const result = await renameChat('appA', 'c1', '支付排障｜待验证');
+    expect(result).toEqual({
+      ok: true,
+      oldName: 'one',
+      newName: '支付排障｜待验证',
+      changed: true,
+    });
+    expect(chatUpdateStub).toHaveBeenCalledWith({
+      path: { chat_id: 'c1' },
+      data: { name: '支付排障｜待验证' },
+    });
+  });
+
+  it('renameChat maps a missing update scope to permission_denied', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', '新群名')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+    });
+  });
+
+  it('renameChat returns same-name success before consulting the proactive write gate', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 600,
+    }));
+    await expect(renameChat('appA', 'c1', 'one', { beforeUpdate })).resolves.toEqual({
+      ok: true,
+      oldName: 'one',
+      newName: 'one',
+      changed: false,
+    });
+    expect(beforeUpdate).not.toHaveBeenCalled();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat rate-limits a different-name proactive retry before the write', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 599,
+    }));
+    await expect(renameChat('appA', 'c1', 'two', { beforeUpdate })).resolves.toEqual({
+      ok: false,
+      error: 'rate_limited',
+      retryAfterSeconds: 599,
+      oldName: 'one',
+      newName: 'two',
+    });
+    expect(beforeUpdate).toHaveBeenCalledOnce();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat preserves old/new names and the Lark code on update failure', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', 'two')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+      oldName: 'one',
+      newName: 'two',
+      larkCode: 99991672,
+    });
+  });
+
+  it('addBotToChat marks invalid_id_list as failed and rest as ok', async () => {
+    const r = await addBotToChat('appA', 'c1', ['cli_Y', 'cli_X']);
+    expect(r.find(x => x.id === 'cli_Y')!.ok).toBe(true);
+    expect(r.find(x => x.id === 'cli_X')!.ok).toBe(false);
+    expect(r.find(x => x.id === 'cli_X')!.error).toBe('invalid_id');
+  });
+
+  it('addBotToChat with empty list returns empty', async () => {
+    expect(await addBotToChat('appA', 'c1', [])).toEqual([]);
+  });
+
+  it('createChat returns chatId and forwards bot list (excluding creator)', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_new123', invalid_bot_id_list: [] },
+    });
+    const r = await createChat('cli_creator', { name: 'team', botIds: ['cli_creator', 'cli_other'] });
+    expect(r.chatId).toBe('oc_new123');
+    expect(r.invalidBotIds).toEqual([]);
+    // Verify bot_id_list passed only the non-creator ids.
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.name).toBe('team');
+    expect(callArgs.data.bot_id_list).toEqual(['cli_other']);
+  });
+
+  it('createChat omits bot_id_list when only creator is in the bot list', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_solo' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.bot_id_list).toBeUndefined();
+    expect(callArgs.data.name).toBeUndefined();
+  });
+
+  it('createChat throws on non-zero Lark response', async () => {
+    chatCreateStub.mockResolvedValueOnce({ code: 1234, msg: 'permission denied' });
+    await expect(createChat('cli_creator', { botIds: ['cli_x'] })).rejects.toThrow(/permission denied/);
+  });
+
+  it('createChat surfaces invalid_bot_id_list', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_partial', invalid_bot_id_list: ['cli_bad'] },
+    });
+    const r = await createChat('cli_creator', { botIds: ['cli_creator', 'cli_good', 'cli_bad'] });
+    expect(r.invalidBotIds).toEqual(['cli_bad']);
+  });
+
+  it('createChat passes userIds as user_id_list with user_id_type=open_id', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_with_user', invalid_bot_id_list: [], invalid_user_id_list: [] },
+    });
+    const r = await createChat('cli_creator', {
+      botIds: ['cli_creator'],
+      userIds: ['ou_human123'],
+    });
+    expect(r.chatId).toBe('oc_with_user');
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.user_id_list).toEqual(['ou_human123']);
+    expect(callArgs.params.user_id_type).toBe('open_id');
+    // creator is the only bot in opts.botIds, so bot_id_list should be omitted.
+    expect(callArgs.data.bot_id_list).toBeUndefined();
+  });
+
+  it('createChat surfaces invalid_user_id_list', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_partial_user', invalid_bot_id_list: [], invalid_user_id_list: ['ou_ghost'] },
+    });
+    const r = await createChat('cli_creator', {
+      botIds: ['cli_creator'],
+      userIds: ['ou_real', 'ou_ghost'],
+    });
+    expect(r.invalidUserIds).toEqual(['ou_ghost']);
+  });
+
+  it('transferChatOwner posts owner_id with user_id_type=open_id', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_human');
+    expect(r).toEqual({ ok: true });
+    const call = chatUpdateStub.mock.calls[0][0];
+    expect(call.path.chat_id).toBe('oc_chat');
+    expect(call.params.user_id_type).toBe('open_id');
+    expect(call.data.owner_id).toBe('ou_human');
+  });
+
+  it('transferChatOwner can transfer by union_id after a cross-deployment invite', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'on_human', 'union_id');
+    expect(r).toEqual({ ok: true });
+    const call = chatUpdateStub.mock.calls[0][0];
+    expect(call.params.user_id_type).toBe('union_id');
+    expect(call.data.owner_id).toBe('on_human');
+  });
+
+  it('transferChatOwner returns error on non-zero Lark response', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 230002, msg: 'user not in chat' });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_ghost');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/user not in chat/);
+  });
+
+  it('transferChatOwner catches thrown errors', async () => {
+    chatUpdateStub.mockRejectedValueOnce(new Error('network down'));
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_x');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/network down/);
+  });
+
+  it('createChat omits user_id_list and user_id_type when no userIds provided', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_no_user' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator', 'cli_other'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.user_id_list).toBeUndefined();
+    expect(callArgs.params?.user_id_type).toBeUndefined();
+  });
+
+  it('createChat forwards chatMode as data.chat_mode when set', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_topic' },
+    });
+    const r = await createChat('cli_creator', {
+      name: 'topic chat',
+      botIds: ['cli_creator'],
+      chatMode: 'topic',
+    });
+    expect(r.chatId).toBe('oc_topic');
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.chat_mode).toBe('topic');
+  });
+
+  it('createChat omits chat_mode when chatMode is not provided', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_default' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator', 'cli_other'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    // Absent field -> Feishu's default (普通群). We must not pin it explicitly.
+    expect(callArgs.data.chat_mode).toBeUndefined();
+  });
+
+  it('getChatShareLink returns share_link and passes validity_period (default permanently)', async () => {
+    chatLinkStub.mockResolvedValueOnce({
+      code: 0,
+      data: { share_link: 'https://applink.feishu.cn/.../add_by_link?link_token=tok', is_permanent: true },
+    });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.shareLink).toMatch(/add_by_link/);
+    const callArgs = chatLinkStub.mock.calls[0][0];
+    expect(callArgs.path.chat_id).toBe('oc_chat');
+    expect(callArgs.data.validity_period).toBe('permanently');
+  });
+
+  it('getChatShareLink surfaces non-zero code as error (e.g. unsupported chat type)', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 232001, msg: 'unsupported chat type' });
+    const r = await getChatShareLink('cli_creator', 'oc_p2p');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/unsupported chat type.*232001/);
+  });
+
+  it('getChatShareLink treats empty share_link as error', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 0, data: {} });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/empty share_link/);
+  });
+
+  it('getChatShareLink catches thrown errors', async () => {
+    chatLinkStub.mockRejectedValueOnce(new Error('network down'));
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/network down/);
+  });
+
+  it('addChatManagers returns ok: true when managerIds is empty without API call', async () => {
+    const r = await addChatManagers('cli_creator', 'oc_chat', []);
+    expect(r).toEqual({ ok: true, addedManagers: [] });
+    expect(chatManagersAddStub).not.toHaveBeenCalled();
+  });
+
+  it('addChatManagers posts manager_ids with open_id by default', async () => {
+    chatManagersAddStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_managers: ['ou_manager1'] },
+    });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_manager1']);
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_manager1'] });
+    const call = chatManagersAddStub.mock.calls[0][0];
+    expect(call.path.chat_id).toBe('oc_chat');
+    expect(call.params.member_id_type).toBe('open_id');
+    expect(call.data.manager_ids).toEqual(['ou_manager1']);
+  });
+
+  it('addChatManagers supports custom member_id_type', async () => {
+    chatManagersAddStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_managers: ['on_union_mgr'] },
+    });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['on_union_mgr'], 'union_id');
+    expect(r).toEqual({ ok: true, addedManagers: ['on_union_mgr'] });
+    const call = chatManagersAddStub.mock.calls[0][0];
+    expect(call.params.member_id_type).toBe('union_id');
+  });
+
+  it('addChatManagers fails fast without retrying when permanent error is encountered', async () => {
+    chatManagersAddStub.mockResolvedValue({ code: 232001, msg: 'permission denied' });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
+    if (!r.ok) expect(r.error).toMatch(/permission denied.*232001/);
+  });
+
+  it('addChatManagers fails fast on missing scope error (99991672)', async () => {
+    chatManagersAddStub.mockResolvedValue({ code: 99991672, msg: 'missing scope' });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
+    if (!r.ok) expect(r.error).toMatch(/missing scope.*99991672/);
+  });
+
+  it('addChatManagers surfaces transient error after exhausting retries', async () => {
+    chatManagersAddStub.mockResolvedValue({ code: 232011, msg: 'user not in chat' });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(3);
+    if (!r.ok) expect(r.error).toMatch(/user not in chat.*232011/);
+  });
+
+  it('addChatManagers retries after transient failure and succeeds on next attempt', async () => {
+    chatManagersAddStub
+      .mockResolvedValueOnce({ code: 232011, msg: 'user not in chat' })
+      .mockResolvedValueOnce({ code: 0, data: { chat_managers: ['ou_m1'] } });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_m1'], 'open_id', { retryDelayMs: 1 });
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_m1'] });
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('addChatManagers fails fast when thrown error is AxiosError with permanent code in response.data.code', async () => {
+    const axiosError: any = new Error('Request failed with status code 403');
+    axiosError.code = 'ERR_BAD_REQUEST';
+    axiosError.response = { status: 403, data: { code: 99991672, msg: 'missing scope' } };
+    chatManagersAddStub.mockRejectedValue(axiosError);
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
+    if (!r.ok) expect(r.error).toMatch(/Request failed with status code 403/);
+  });
+
+  it('addChatManagers treats 40003 as transient internal error and retries', async () => {
+    chatManagersAddStub
+      .mockResolvedValueOnce({ code: 40003, msg: 'internal error' })
+      .mockResolvedValueOnce({ code: 0, data: { chat_managers: ['ou_m1'] } });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_m1'], 'open_id', { retryDelayMs: 1 });
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_m1'] });
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('addChatManagers falls back to retrying unknown error codes', async () => {
+    chatManagersAddStub
+      .mockResolvedValueOnce({ code: 88888888, msg: 'unknown error' })
+      .mockResolvedValueOnce({ code: 0, data: { chat_managers: ['ou_m1'] } });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_m1'], 'open_id', { retryDelayMs: 1 });
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_m1'] });
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('addChatManagers catches thrown network errors and exhausts retries', async () => {
+    chatManagersAddStub.mockRejectedValue(new Error('network timeout'));
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_err'], 'open_id', { maxRetries: 1, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+    if (!r.ok) expect(r.error).toMatch(/network timeout/);
+  });
+});

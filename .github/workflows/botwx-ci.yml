@@ -1,0 +1,36 @@
+name: Botwx CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: botwx-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install locked dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: bun install --frozen-lockfile
+      - name: Build and audit distribution
+        run: bun run build
+      - name: WeChat connector unit tests
+        run: bun run test:unit:weixin
+      - name: weixin-agent-sdk protocol E2E
+        run: bun run test:e2e:weixin

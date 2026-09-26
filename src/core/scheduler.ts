@@ -1,0 +1,1200 @@
+import { Cron } from 'croner';
+import { randomUUID } from 'node:crypto';
+import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
+import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
+import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
+import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
+import { emitHookEvent } from '../services/hook-runner.js';
+import { logger } from '../utils/logger.js';
+import { dashboardEventBus } from './dashboard-events.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+
+export interface ScheduleExecutionContext {
+  runId: string;
+  trigger: 'scheduler' | 'dashboard';
+  startedAt: string;
+}
+
+// Callback set by daemon to execute a scheduled task
+let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
+let tickTimer: NodeJS.Timeout | null = null;
+// Last effective schedule timezone seen by the tick loop. When it changes
+// (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
+// computed under the OLD zone and must be recomputed — otherwise they'd fire
+// once at the stale wall-clock time. null = not yet initialized (first tick).
+let lastTickTz: string | null = null;
+
+/** Owner-filter state — each daemon process runs its own scheduler but only
+ *  executes tasks whose larkAppId matches.  Legacy tasks without a larkAppId
+ *  fall through to the "primary" daemon (bot-0), matching pre-refactor behavior. */
+let ownerAppId: string | null = null;
+let ownerIsPrimary = false;
+
+const TICK_INTERVAL_MS = 30_000;          // poll every 30s
+const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
+const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
+const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
+
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error' | 'skipped', error?: unknown): void {
+  const chatIds = task.chatIds
+    ? scheduleStore.effectiveScheduleChatIds(task)
+    : [task.chatId];
+  emitHookEvent('schedule.fired', {
+    id: task.id,
+    name: task.name,
+    schedule: task.schedule,
+    status,
+    error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
+    chatId: task.chatId,
+    // Preserve the exact legacy hook payload for single-chat tasks while
+    // exposing every independently dispatched target for multi-chat tasks.
+    ...(chatIds.length > 1 ? { chatIds } : {}),
+    rootMessageId: task.rootMessageId,
+    chatType: task.chatType,
+    scope: task.scope,
+    larkAppId: task.larkAppId,
+    runAt: Date.now(),
+  });
+}
+
+export function setExecuteCallback(
+  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>,
+): void {
+  executeCallback = cb;
+}
+
+function createExecutionContext(
+  trigger: ScheduleExecutionContext['trigger'],
+  startedAt = new Date().toISOString(),
+): ScheduleExecutionContext {
+  return { runId: randomUUID(), trigger, startedAt };
+}
+
+function cleanupRemovedTaskPrecondition(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeSchedulePrecondition(appId, task.id);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove protected precondition for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskRunLogs(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeScheduleRunLogs(task.id, appId);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove execution logs for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
+  cleanupRemovedTaskPrecondition(task);
+  cleanupRemovedTaskRunLogs(task);
+}
+
+function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
+  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+}
+
+function recordDispatchOutcome(
+  task: ScheduledTask,
+  context: ScheduleExecutionContext,
+  outcome: ScheduledTaskPreconditionOutcome | void,
+): void {
+  const status = outcome === 'skipped' ? 'skipped' : 'ok';
+  if (status === 'skipped') {
+    let nextRunAt: string | undefined;
+    if (task.parsed.kind === 'once') {
+      // Keep a one-shot eligible after a skipped check, including runNow,
+      // which clears nextRunAt before dispatch. Do not bring a future plan forward.
+      const scheduledAt = task.nextRunAt ?? task.parsed.runAt;
+      const retryAt = Date.now() + TICK_INTERVAL_MS;
+      nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
+    }
+    scheduleStore.markSkipped(task.id, nextRunAt, context.runId);
+  } else {
+    scheduleStore.markRun(task.id, true, undefined, undefined, context.runId);
+    cleanupIfTaskWasAutoRemoved(task);
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id: task.id, runAt: Date.now(), status },
+  });
+  emitScheduleFiredHook(task, status);
+}
+
+/**
+ * Bind the scheduler to a specific bot (larkAppId).  In multi-bot setups every
+ * daemon process runs its own scheduler; this filter prevents double-execution
+ * by ensuring each task is only handled by the daemon whose bot is actually
+ * a member of the task's origin chat.
+ *
+ * @param larkAppId — this daemon's bot app id
+ * @param isPrimary — true only for bot-0; legacy tasks without larkAppId are
+ *                    routed here as a compatibility fallback
+ */
+export function setOwnerFilter(larkAppId: string, isPrimary: boolean): void {
+  ownerAppId = larkAppId;
+  ownerIsPrimary = isPrimary;
+}
+
+function taskBelongsToThisDaemon(task: ScheduledTask): boolean {
+  if (ownerAppId === null) return true; // filter not configured — act like legacy (run all)
+  if (task.larkAppId) return task.larkAppId === ownerAppId;
+  // No larkAppId on task (legacy) — only the primary (bot-0) handles it.
+  return ownerIsPrimary;
+}
+
+/** Public ownership check — used by dashboard IPC to filter list-by-owner. */
+export function belongsToOwner(task: ScheduledTask): boolean {
+  return taskBelongsToThisDaemon(task);
+}
+
+// ─── Chinese NL parsing (schedule portion only, returns ParsedSchedule) ─────
+
+const WEEKDAY_MAP: Record<string, number> = {
+  '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 0, '天': 0,
+};
+
+function parseTimeHM(s: string): { hour: number; minute: number; rest: string } | null {
+  let m = s.match(/^(\d{1,2})[::：](\d{2})\s*(.*)/s);
+  if (m) return { hour: parseInt(m[1]), minute: parseInt(m[2]), rest: m[3] };
+  m = s.match(/^(\d{1,2})点(\d{1,2})分?\s*(.*)/s);
+  if (m) return { hour: parseInt(m[1]), minute: parseInt(m[2]), rest: m[3] };
+  m = s.match(/^(\d{1,2})点\s*(.*)/s);
+  if (m) return { hour: parseInt(m[1]), minute: 0, rest: m[2] };
+  return null;
+}
+
+/** Parse Chinese NL → { parsed, rest } where rest is the remaining text after schedule. */
+function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: string } | null {
+  const s = input.trim();
+
+  // 工作日每天 HH:MM
+  let m = s.match(/^(?:每个?工作日|工作日每[天日])\s*(.*)/);
+  if (m) {
+    const t = parseTimeHM(m[1]);
+    if (t) return { parsed: cronPS(`${t.minute} ${t.hour} * * 1-5`, `工作日 ${t.hour}:${String(t.minute).padStart(2,'0')}`), rest: t.rest };
+  }
+
+  // 每天/每日 HH:MM
+  m = s.match(/^每[天日]\s*(.*)/);
+  if (m) {
+    const t = parseTimeHM(m[1]);
+    if (t) return { parsed: cronPS(`${t.minute} ${t.hour} * * *`, `每天 ${t.hour}:${String(t.minute).padStart(2,'0')}`), rest: t.rest };
+  }
+
+  // 每周X HH:MM
+  m = s.match(/^每周([一二三四五六日天])\s*(.*)/);
+  if (m) {
+    const day = WEEKDAY_MAP[m[1]] ?? 1;
+    const t = parseTimeHM(m[2]);
+    if (t) return { parsed: cronPS(`${t.minute} ${t.hour} * * ${day}`, `每周${m[1]} ${t.hour}:${String(t.minute).padStart(2,'0')}`), rest: t.rest };
+  }
+
+  // 每月X号 HH:MM
+  m = s.match(/^每月(\d{1,2})[号日]\s*(.*)/);
+  if (m) {
+    const dom = parseInt(m[1]);
+    const t = parseTimeHM(m[2]);
+    if (t) return { parsed: cronPS(`${t.minute} ${t.hour} ${dom} * *`, `每月${dom}号 ${t.hour}:${String(t.minute).padStart(2,'0')}`), rest: t.rest };
+  }
+
+  // 每N小时 — keep as cron to preserve wall-clock alignment ("0 */N * * *")
+  m = s.match(/^每(\d+)小时\s*(.*)/);
+  if (m) {
+    const h = parseInt(m[1]);
+    const expr = h === 1 ? '0 * * * *' : `0 */${h} * * *`;
+    return { parsed: cronPS(expr, `每 ${h} 小时`), rest: m[2] };
+  }
+
+  // 每小时
+  m = s.match(/^每小时\s*(.*)/);
+  if (m) return { parsed: cronPS('0 * * * *', '每小时'), rest: m[1] };
+
+  // 每N分钟 — keep as cron for wall-clock alignment ("*/N * * * *")
+  m = s.match(/^每(\d+)分钟\s*(.*)/);
+  if (m) {
+    const min = parseInt(m[1]);
+    return { parsed: cronPS(`*/${min} * * * *`, `每 ${min} 分钟`), rest: m[2] };
+  }
+
+  // N分钟后
+  m = s.match(/^(\d+)\s*分钟后\s*(.*)/);
+  if (m) {
+    const min = parseInt(m[1]);
+    const runAt = new Date(Date.now() + min * 60_000).toISOString();
+    return { parsed: { kind: 'once', runAt, display: `${min} 分钟后` }, rest: m[2] };
+  }
+
+  // N小时后
+  m = s.match(/^(\d+)\s*小时后\s*(.*)/);
+  if (m) {
+    const h = parseInt(m[1]);
+    const runAt = new Date(Date.now() + h * 3600_000).toISOString();
+    return { parsed: { kind: 'once', runAt, display: `${h} 小时后` }, rest: m[2] };
+  }
+
+  // 明天 HH:MM
+  m = s.match(/^明天\s*(.*)/);
+  if (m) {
+    const t = parseTimeHM(m[1]);
+    if (t) {
+      // 「明天HH:MM」是墙上时间：解析到 scheduleTimeZone()（与 cron 触发/显示同源），
+      // 而非主机本地 setHours() —— 否则在非目标时区主机上，一次性与重复类会错开一个时差。
+      const d = zonedTomorrowAt(scheduleTimeZone(), t.hour, t.minute);
+      return { parsed: { kind: 'once', runAt: d.toISOString(), display: `明天 ${t.hour}:${String(t.minute).padStart(2,'0')}` }, rest: t.rest };
+    }
+  }
+
+  return null;
+}
+
+function cronPS(expr: string, display: string): ParsedSchedule {
+  return { kind: 'cron', expr, display };
+}
+
+// ─── Public parser: arbitrary schedule string → ParsedSchedule ──────────────
+
+/**
+ * Parse a bare schedule string (no prompt).  Supports:
+ *   - Chinese NL: "每日17:50" / "每周一10:00" / "30分钟后" / "明天9:00"
+ *   - English duration: "30m", "2h", "1d" (one-shot from now)
+ *   - English interval: "every 30m", "every 2h"
+ *   - Cron expression: "0 9 * * *" (5 space-separated fields)
+ *   - ISO timestamp: "2026-05-01T10:00:00" (one-shot at time)
+ */
+export function parseSchedule(input: string): ParsedSchedule {
+  const s = input.trim();
+  if (!s) throw new Error('empty schedule');
+
+  // Chinese NL (match only the schedule portion — prompt is separate)
+  const zh = parseChineseSchedule(s);
+  if (zh && !zh.rest.trim()) return zh.parsed;
+  if (zh && zh.rest.trim()) {
+    // Caller passed "每日17:50" without prompt — rest should be empty for bare parse
+    return zh.parsed;
+  }
+
+  // "every Xm/h/d"
+  let m = s.match(/^every\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i);
+  if (m) {
+    const minutes = durationToMinutes(m[1], m[2]);
+    return { kind: 'interval', minutes, display: `every ${minutes}m` };
+  }
+
+  // Cron (5 fields, all cron chars)
+  const parts = s.split(/\s+/);
+  if (parts.length === 5 && parts.every(p => /^[\d*\-,/]+$/.test(p))) {
+    try {
+      new Cron(s);
+      return { kind: 'cron', expr: s, display: s };
+    } catch (err: any) {
+      throw new Error(`invalid cron expression '${s}': ${err.message}`);
+    }
+  }
+
+  // ISO timestamp. NOTE: a string WITH an explicit offset/Z is absolute; a bare
+  // `YYYY-MM-DDTHH:MM` (no offset) is parsed by JS in the HOST-local zone, NOT
+  // scheduleTimeZone() — this is deliberate (an explicit timestamp carries its
+  // own zone contract; we don't reinterpret it). Only the DISPLAY uses the
+  // effective zone. The NL「明天HH:MM」path (above) is the tz-aware one.
+  if (/^\d{4}-\d{2}-\d{2}(T| |$)/.test(s)) {
+    const dt = new Date(s);
+    if (!isNaN(dt.getTime())) {
+      return { kind: 'once', runAt: dt.toISOString(), display: `once at ${dt.toLocaleString('zh-CN', { timeZone: scheduleTimeZone() })}` };
+    }
+  }
+
+  // English duration "30m" / "2h" / "1d"
+  m = s.match(/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i);
+  if (m) {
+    const minutes = durationToMinutes(m[1], m[2]);
+    const runAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    return { kind: 'once', runAt, display: `once in ${s}` };
+  }
+
+  throw new Error(`invalid schedule '${input}'. Use '30m' / 'every 2h' / '0 9 * * *' / '2026-05-01T10:00' / 每日17:50`);
+}
+
+function durationToMinutes(numStr: string, unit: string): number {
+  const u = unit[0].toLowerCase();
+  const mult = u === 'm' ? 1 : u === 'h' ? 60 : u === 'd' ? 1440 : NaN;
+  if (isNaN(mult)) throw new Error(`unknown duration unit: ${unit}`);
+  return parseInt(numStr) * mult;
+}
+
+// ─── NL schedule-with-prompt parser (for /schedule command) ─────────────────
+
+interface ParseNLResult {
+  parsed: ParsedSchedule;
+  prompt: string;
+  name: string;
+}
+
+/**
+ * Parse a natural-language /schedule command, splitting the schedule portion
+ * from the prompt (the task instruction).  Used by the /schedule command
+ * handler where user types e.g. "/schedule 每日17:50 帮我看看AI新闻".
+ */
+export function parseNaturalSchedule(input: string): ParseNLResult | null {
+  const zh = parseChineseSchedule(input.trim());
+  if (!zh) return null;
+
+  // Clean prompt: remove leading connectors and quotes
+  let prompt = zh.rest.replace(/^[给帮]我\s*/, '').trim();
+  prompt = prompt.replace(/^["'"「](.+?)["'"」]$/, '$1').trim();
+  if (!prompt) return null;
+
+  const name = prompt.length > 20 ? prompt.substring(0, 20) + '...' : prompt;
+  return { parsed: zh.parsed, prompt, name };
+}
+
+function extractExecutionPositionModifier(prompt: string): {
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'>;
+  prompt: string;
+} {
+  const topLevelZh = prompt.match(/^\s*(?:群消息顶层|群顶层|顶层)(?:执行|运行)?[\s,，、:：。-]+(.+)$/s);
+  if (topLevelZh && topLevelZh[1].trim()) return { executionPosition: 'top-level', prompt: topLevelZh[1].trim() };
+  const topLevelEn = prompt.match(/^\s*(?:group\s+)?top[\s-]?level[\s,:：-]+(.+)$/is);
+  if (topLevelEn && topLevelEn[1].trim()) return { executionPosition: 'top-level', prompt: topLevelEn[1].trim() };
+
+  const zh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*[开起另一个新的\s]*新[开起另一个新的\s]*话题[\s,，、:：。-]*(.+)$/s);
+  if (zh && zh[1].trim()) return { executionPosition: 'new-topic', prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*(?:every\s+run\s+in\s+a\s+)?new[\s-]?topic[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { executionPosition: 'new-topic', prompt: en[1].trim() };
+
+  // Dedicated per-task topic: 独立话题 / 专属话题 (and English dedicated/task/
+  // own topic). Must stay distinct from the 新话题 / new-topic patterns above —
+  // a task topic is created once and reused across that task's own fires.
+  const taskZh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*(?:独立|专属)(?:的)?话题[\s,，、:：。-]*(.+)$/s);
+  if (taskZh && taskZh[1].trim()) return { executionPosition: 'task', prompt: taskZh[1].trim() };
+  const taskEn = prompt.match(/^\s*(?:every\s+run\s+in\s+(?:its\s+own|a\s+dedicated)\s+topic|(?:dedicated|task|own)[\s-]?topic)[\s,:：-]+(.+)$/is);
+  if (taskEn && taskEn[1].trim()) return { executionPosition: 'task', prompt: taskEn[1].trim() };
+  return { prompt };
+}
+
+/** Backward-compatible parser; `deliver:new-topic` means a routing modifier
+ * was present. New callers should also read extractScheduleModifiers.position. */
+export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
+  const parsed = extractExecutionPositionModifier(prompt);
+  return parsed.executionPosition
+    ? { deliver: 'new-topic', prompt: parsed.prompt }
+    : { deliver: 'origin', prompt };
+}
+
+/**
+ * Detect a leading "silent" keyword in a /schedule prompt and strip it.  Lets
+ * users write `/schedule 每30分钟 静默 检查服务，挂了才报警` so fires post no
+ * "🕐 task started" banner and the model decides whether to `botmux send`.
+ * The keyword must be followed by whitespace/punctuation — a prompt that
+ * merely *starts with* 静默 as part of a longer word (静默模式…) is left
+ * untouched only when nothing separates it, so document the spaced form.
+ */
+export function extractSilentMode(prompt: string): { silent: boolean; prompt: string } {
+  const zh = prompt.match(/^\s*(?:静默|悄悄)(?:执行|运行|地)?[\s,，、:：。-]+(.+)$/s);
+  if (zh && zh[1].trim()) return { silent: true, prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*silent(?:ly)?[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { silent: true, prompt: en[1].trim() };
+  return { silent: false, prompt };
+}
+
+/**
+ * Extract both /schedule prompt modifiers regardless of their order.
+ * `deliver:new-topic` remains a compatibility token indicating that a routing
+ * modifier was present. `executionPosition` carries the unambiguous modern
+ * value: group top level, a fresh topic on every run, or the task's own
+ * dedicated topic. The dedicated-task position stays `deliver:'origin'` — it
+ * is a normal in-chat delivery target, not the legacy new-topic delivery.
+ */
+export function extractScheduleModifiers(prompt: string): {
+  deliver: 'origin' | 'new-topic';
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'>;
+  silent: boolean;
+  prompt: string;
+} {
+  let deliver: 'origin' | 'new-topic' = 'origin';
+  let executionPosition: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'> | undefined;
+  let silent = false;
+  let rest = prompt;
+  // Two keywords max — loop twice so either order is handled.
+  for (let i = 0; i < 2; i++) {
+    const d = extractExecutionPositionModifier(rest);
+    if (d.executionPosition) {
+      if (d.executionPosition !== 'task') deliver = 'new-topic';
+      executionPosition = d.executionPosition;
+      rest = d.prompt;
+      continue;
+    }
+    const s = extractSilentMode(rest);
+    if (s.silent) { silent = true; rest = s.prompt; continue; }
+    break;
+  }
+  return { deliver, ...(executionPosition ? { executionPosition } : {}), silent, prompt: rest };
+}
+
+// ─── next-run computation ───────────────────────────────────────────────────
+
+/** Compute the next run time for a parsed schedule. Returns ISO string, or null if exhausted. */
+export function computeNextRun(parsed: ParsedSchedule, lastRunAt?: string): string | null {
+  const now = Date.now();
+
+  if (parsed.kind === 'once') {
+    if (lastRunAt) return null; // one-shot has already run
+    if (!parsed.runAt) return null;
+    const runAtMs = new Date(parsed.runAt).getTime();
+    // Allow ONESHOT_GRACE_SECONDS for late firing
+    if (runAtMs >= now - ONESHOT_GRACE_SECONDS * 1000) return parsed.runAt;
+    return null;
+  }
+
+  if (parsed.kind === 'interval') {
+    if (!parsed.minutes) return null;
+    const base = lastRunAt ? new Date(lastRunAt).getTime() : now;
+    return new Date(base + parsed.minutes * 60_000).toISOString();
+  }
+
+  if (parsed.kind === 'cron') {
+    if (!parsed.expr) return null;
+    try {
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
+      const next = job.nextRun(new Date(now));
+      return next ? next.toISOString() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/** Compute grace window (how late a missed run can be and still catch up) */
+function computeGraceSeconds(parsed: ParsedSchedule): number {
+  let periodSec: number;
+  if (parsed.kind === 'interval' && parsed.minutes) {
+    periodSec = parsed.minutes * 60;
+  } else if (parsed.kind === 'cron' && parsed.expr) {
+    try {
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
+      const first = job.nextRun(new Date());
+      const second = first ? job.nextRun(first) : null;
+      periodSec = first && second ? (second.getTime() - first.getTime()) / 1000 : MIN_GRACE_SECONDS;
+    } catch {
+      periodSec = MIN_GRACE_SECONDS;
+    }
+  } else {
+    return MIN_GRACE_SECONDS;
+  }
+  const grace = Math.floor(periodSec / 2);
+  return Math.max(MIN_GRACE_SECONDS, Math.min(grace, MAX_GRACE_SECONDS));
+}
+
+// ─── Tick loop ──────────────────────────────────────────────────────────────
+
+async function tick(): Promise<void> {
+  const tasks = scheduleStore.listTasks();
+  const now = Date.now();
+
+  // Re-align to a changed effective timezone before the fire loop.
+  const tz = scheduleTimeZone();
+  if (lastTickTz !== null && lastTickTz !== tz) {
+    applyCronRealign(planCronRealign(tasks, taskBelongsToThisDaemon));
+    // Tell the dashboard/web the effective zone changed so open tabs re-render
+    // schedule times in the new zone (even when no cron task needed recompute).
+    dashboardEventBus.publish({ type: 'schedule.timezone', body: { timezone: tz } });
+    logger.info(`[scheduler] schedule timezone ${lastTickTz} → ${tz}; re-aligned enabled cron next-runs`);
+  }
+  lastTickTz = tz;
+
+  for (const task of tasks) {
+    if (!task.enabled) continue;
+    if (!taskBelongsToThisDaemon(task)) continue;
+
+    let nextRunAt = task.nextRunAt;
+    if (!nextRunAt) {
+      // Recover: compute from parsed + lastRunAt
+      const recovered = computeNextRun(task.parsed, task.lastRunAt);
+      if (!recovered) continue;
+      nextRunAt = recovered;
+      scheduleStore.updateTask(task.id, { nextRunAt });
+    }
+
+    const nextMs = new Date(nextRunAt).getTime();
+    if (nextMs > now) continue;
+
+    // Recurring: fast-forward if stale beyond grace window
+    if (task.parsed.kind !== 'once') {
+      const grace = computeGraceSeconds(task.parsed);
+      if ((now - nextMs) / 1000 > grace) {
+        const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
+        if (newNext) {
+          logger.info(`[scheduler] Task "${task.name}" missed window (${Math.round((now-nextMs)/1000)}s late, grace=${grace}s), fast-forward to ${newNext}`);
+          scheduleStore.updateTask(task.id, { nextRunAt: newNext });
+          continue;
+        }
+      }
+    }
+
+    const executionContext = createExecutionContext('scheduler');
+    // Claim every due run before dispatch. Recurring tasks advance to their next
+    // occurrence; one-shots persist lastRunAt and clear nextRunAt, so another
+    // scheduler tick (or a daemon restart) cannot dispatch the same run while
+    // its asynchronous model turn is still in flight. A precondition skip
+    // explicitly restores a one-shot retry time in recordDispatchOutcome().
+    const newNext = computeNextRun(task.parsed, executionContext.startedAt);
+    const claim = scheduleStore.claimRun(task.id, {
+      lastRunAt: executionContext.startedAt,
+      nextRunAt: newNext ?? undefined,
+      lastRunId: executionContext.runId,
+    });
+    if (!claim.ok) continue;
+    const claimedTask = claim.task;
+    logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
+
+    if (executeCallback) {
+      const taskId = claimedTask.id;
+      executeCallback(claimedTask, executionContext)
+        .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
+        .catch(err => {
+          logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
+          scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
+          cleanupIfTaskWasAutoRemoved(claimedTask);
+          dashboardEventBus.publish({
+            type: 'schedule.fired',
+            body: {
+              id: taskId,
+              runAt: Date.now(),
+              status: 'error',
+              error: err instanceof Error ? err.message : String(err),
+            },
+          });
+          emitScheduleFiredHook(claimedTask, 'error', err);
+        });
+    } else {
+      scheduleStore.markRun(
+        claimedTask.id,
+        false,
+        'scheduler execute callback is not initialised',
+        undefined,
+        executionContext.runId,
+      );
+    }
+  }
+}
+
+/**
+ * Plan which enabled CRON tasks need their `nextRunAt` recomputed after the
+ * effective schedule timezone changed. CRON is the only tz-dependent kind
+ * (wall-clock); `interval` is a relative period and `once` is a fixed instant,
+ * so both are skipped. `computeNextRun()` returns the next FUTURE occurrence,
+ * so applying these updates never causes an immediate or duplicate fire.
+ * Pure (no store writes) → unit-testable; tick() applies the returned plan.
+ */
+export function planCronRealign(
+  tasks: ScheduledTask[],
+  belongs: (t: ScheduledTask) => boolean = () => true,
+): Array<{ id: string; nextRunAt: string }> {
+  const updates: Array<{ id: string; nextRunAt: string }> = [];
+  for (const task of tasks) {
+    if (!task.enabled || task.parsed.kind !== 'cron') continue;
+    if (!belongs(task)) continue;
+    const next = computeNextRun(task.parsed);
+    if (next && next !== task.nextRunAt) updates.push({ id: task.id, nextRunAt: next });
+  }
+  return updates;
+}
+
+/** Persist a realign plan AND publish `schedule.updated` per task so the
+ *  dashboard aggregator + open web tabs reflect the new nextRunAt (a bare
+ *  scheduleStore.updateTask inside the daemon does not reach them on its own). */
+function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): void {
+  for (const u of updates) {
+    scheduleStore.updateTask(u.id, { nextRunAt: u.nextRunAt });
+    dashboardEventBus.publish({ type: 'schedule.updated', body: { id: u.id, patch: { nextRunAt: u.nextRunAt } } });
+  }
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+export function startScheduler(): void {
+  const startupTasks = scheduleStore.listTasks();
+  for (const task of startupTasks) {
+    if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
+    scheduleStore.markRun(
+      task.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      task.lastRunId,
+    );
+  }
+  const tasks = scheduleStore.listTasks();
+  const enabled = tasks.filter(t => t.enabled);
+  logger.info(`[scheduler] Starting with ${enabled.length}/${tasks.length} enabled tasks (tick every ${TICK_INTERVAL_MS/1000}s)`);
+
+  // Ensure next_run_at exists for all enabled tasks
+  for (const task of enabled) {
+    if (!task.nextRunAt) {
+      const next = computeNextRun(task.parsed, task.lastRunAt);
+      if (next) scheduleStore.updateTask(task.id, { nextRunAt: next });
+    }
+  }
+
+  // Startup re-align: if the effective timezone changed while the daemon was
+  // STOPPED (config/env edited during downtime), enabled cron tasks' persisted
+  // FUTURE nextRunAt is stale (the live-change path in tick() couldn't catch it).
+  // Recompute future-dated ones — idempotent when tz is unchanged (same next
+  // occurrence). Past-due values are left for tick()'s catch-up/fast-forward so
+  // a genuine missed run isn't silently dropped.
+  const startupNow = Date.now();
+  applyCronRealign(planCronRealign(
+    tasks,
+    t => taskBelongsToThisDaemon(t) && !!t.nextRunAt && new Date(t.nextRunAt).getTime() > startupNow,
+  ));
+  // Seed lastTickTz so the first tick doesn't redundantly re-align what we just did.
+  lastTickTz = scheduleTimeZone();
+
+  // Run first tick shortly after startup, then on interval
+  setTimeout(() => { tick().catch(err => logger.error(`[scheduler] tick error: ${err.message}`)); }, 5000);
+  tickTimer = setInterval(() => {
+    tick().catch(err => logger.error(`[scheduler] tick error: ${err.message}`));
+  }, TICK_INTERVAL_MS);
+}
+
+export function stopScheduler(): void {
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  logger.info('[scheduler] Stopped');
+}
+
+/** Limit configuration writes, not loading, dispatch or trusted rollback of
+ * legacy tasks. The first chat is the primary target, so order matters. */
+export function assertScheduleChatTargetLimit(chatIds: readonly string[], previous?: readonly string[]): void {
+  if (
+    chatIds.length > 5
+    && (!previous || chatIds.length !== previous.length || chatIds.some((id, index) => id !== previous[index]))
+  ) {
+    throw new Error('too_many_target_chats');
+  }
+}
+
+export function addTask(params: {
+  id?: string;
+  preconditionRef?: string;
+  name: string;
+  schedule: string;
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  chatIds?: readonly string[];
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
+  chatType?: 'group' | 'p2p' | 'topic_group';
+  larkAppId?: string;
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
+  /** Creator's Lark open_id, stamped so daemon-initiated scheduled turns can
+   *  authenticate workflow commands as the creator (see
+   *  scheduled-turn-provenance). Absent for CLI-created tasks without a
+   *  resolvable creator — those keep the historical behavior. */
+  ownerOpenId?: string;
+  /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
+   *  a task without it runs its scheduled turns with no user identity. */
+  ownerUnionId?: string;
+  parsed?: ParsedSchedule;
+  repeat?: { times: number | null; completed: number };
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
+  /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
+  followActive?: boolean;
+  /** See ScheduledTask.model — per-task CLI model for this task's own runs. */
+  model?: string;
+  /** See ScheduledTask.reasoningEffort. */
+  reasoningEffort?: ScheduleReasoningEffort;
+}): ScheduledTask {
+  const targets = params.chatIds === undefined
+    ? { chatId: params.chatId }
+    : scheduleStore.normalizeScheduleChatTargets({
+        chatId: params.chatId,
+        chatIds: params.chatIds,
+      });
+  assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
+  const parsed = params.parsed ?? parseSchedule(params.schedule);
+  const nextRunAt = computeNextRun(parsed) ?? undefined;
+  const executionPosition: ScheduleExecutionPosition = params.executionPosition
+    ?? (params.deliver === 'new-topic'
+      ? 'new-topic'
+      : params.scope === 'chat'
+        ? 'top-level'
+        : params.rootMessageId ? 'topic' : 'top-level');
+  if (executionPosition === 'topic' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_topic_unsupported');
+  }
+  // A task's dedicated topic is created inside its own group — spanning
+  // multiple groups would make the one-topic-per-task identity ambiguous.
+  if (executionPosition === 'task' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_task_unsupported');
+  }
+  if (executionPosition === 'topic' && !params.rootMessageId?.trim()) {
+    throw new Error('topic_root_required');
+  }
+  // Following the active topic only makes sense when the task lands in a
+  // topic at all; at top level / new-topic there is nothing to follow.
+  if (params.followActive === true && executionPosition !== 'topic') {
+    throw new Error('follow_active_requires_topic');
+  }
+  const topicTitle = normalizeTopicTitle(params.topicTitle);
+  // Task position owns a topic (created lazily by its first fire), so the row
+  // is thread-scoped like an explicit topic — but the root only exists after
+  // the first fire.
+  const scope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
+  const task = scheduleStore.createTask({
+    id: params.id,
+    preconditionRef: params.preconditionRef,
+    name: params.name,
+    schedule: params.schedule,
+    parsed,
+    prompt: params.prompt,
+    workingDir: params.workingDir,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
+    // Only explicit topic execution keeps a caller root. A task-position root
+    // is written back by the first fire / restart recovery, so a root supplied
+    // at creation (foreign to this task) must never be persisted.
+    rootMessageId: executionPosition === 'topic' ? params.rootMessageId : undefined,
+    scope,
+    executionPosition,
+    topicTitle,
+    chatType: params.chatType,
+    larkAppId: params.larkAppId,
+    creatorChatId: params.creatorChatId,
+    creatorRootMessageId: params.creatorRootMessageId,
+    creatorLarkAppId: params.creatorLarkAppId,
+    ownerOpenId: params.ownerOpenId,
+    ownerUnionId: params.ownerUnionId,
+    nextRunAt,
+    repeat: params.repeat,
+    // Delivery shape is now expressed by scope/rootMessageId. Persist only the
+    // local-vs-chat distinction; schedule-store also normalizes legacy values.
+    deliver: params.deliver === 'local' ? 'local' : 'origin',
+    silent: params.silent,
+    followActive: params.followActive === true ? true : undefined,
+    model: params.model?.trim() || undefined,
+    reasoningEffort: params.reasoningEffort,
+  });
+  logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
+  return task;
+}
+
+export function normalizeTopicTitle(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const chars = Array.from(trimmed);
+  if (chars.length > 200) throw new Error('topic_title_too_long');
+  return trimmed;
+}
+
+export function resolveTaskExecutionPosition(
+  task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
+): ScheduleExecutionPosition {
+  if (task.executionPosition === 'top-level' || task.executionPosition === 'topic' || task.executionPosition === 'new-topic') {
+    return task.executionPosition === 'topic' && !task.rootMessageId ? 'top-level' : task.executionPosition;
+  }
+  // Task position: before the dedicated topic materializes (no root yet) the
+  // fire path owns first-fire creation; once the root has been written back,
+  // execution rides the ordinary retained-thread branch ('topic').
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'topic' : 'task';
+  if (task.deliver === 'new-topic') return 'new-topic';
+  if (task.scope === 'chat') return 'top-level';
+  return task.rootMessageId ? 'topic' : 'top-level';
+}
+
+export function removeTask(id: string): boolean {
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  const removed = scheduleStore.removeTask(id);
+  if (removed) cleanupRemovedTaskSidecars(task);
+  return removed;
+}
+
+export function enableTask(id: string): boolean {
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  const next = computeNextRun(task.parsed);
+  scheduleStore.updateTask(id, {
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+  });
+  return true;
+}
+
+export function disableTask(id: string): boolean {
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
+  return true;
+}
+
+export function runTaskNow(id: string): boolean {
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  // Ask the owning daemon to execute ASAP by advancing nextRunAt.  Its tick
+  // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
+  // which was wrong in multi-bot setups — the callback on this daemon may
+  // not even be the right bot for this task.
+  const requested = scheduleStore.requestRunNow(id);
+  if (!requested.ok) return false;
+  logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
+  return true;
+}
+
+export function getNextRun(id: string): Date | null {
+  const task = scheduleStore.getTask(id);
+  if (!task?.nextRunAt) return null;
+  return new Date(task.nextRunAt);
+}
+
+// ─── Dashboard IPC helpers ──────────────────────────────────────────────────
+// Thin {ok, error?}-shaped wrappers used by the web dashboard.  They invoke
+// the real scheduler primitives above and additionally publish dashboard
+// events so subscribed SSE clients see the state change immediately.
+
+/**
+ * Fire a scheduled task immediately. Returns ok=false if id not found or the
+ * scheduler hasn't been initialised with an executeCallback yet.  Emits a
+ * `schedule.fired` event on completion (success, skip or error).
+ */
+export function runNow(id: string): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (!executeCallback) return { ok: false, error: 'not_initialised' };
+  // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
+  // re-fire the same task while this manual run is still in flight.
+  const executionContext = createExecutionContext('dashboard');
+  const next = computeNextRun(task.parsed, executionContext.startedAt);
+  const claim = scheduleStore.claimRun(id, {
+    lastRunAt: executionContext.startedAt,
+    nextRunAt: next ?? undefined,
+    lastRunId: executionContext.runId,
+  });
+  if (!claim.ok) return claim;
+  const claimedTask = claim.task;
+  // Don't block the caller — fire on next tick. `Promise.resolve().then`
+  // coerces a synchronous throw from executeCallback into a rejection so the
+  // error path always runs and we don't leak a 500 to the IPC client.
+  void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
+    outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
+    err => {
+      const msg = err instanceof Error ? err.message : String(err);
+      scheduleStore.markRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      cleanupIfTaskWasAutoRemoved(claimedTask);
+      dashboardEventBus.publish({
+        type: 'schedule.fired',
+        body: { id, runAt: Date.now(), status: 'error', error: msg },
+      });
+      emitScheduleFiredHook(claimedTask, 'error', err);
+    },
+  );
+  return { ok: true };
+}
+
+/**
+ * Toggle a task's `enabled` flag and persist.  When enabling a task we also
+ * recompute `nextRunAt` so the next tick can pick it up.  Emits a
+ * `schedule.updated` event.
+ */
+export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (task.enabled === enabled
+    && (enabled || task.disabledReason === 'manual')) return { ok: true };
+  if (enabled) {
+    const next = computeNextRun(task.parsed);
+    scheduleStore.updateTask(id, {
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    });
+  } else {
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: { enabled } },
+  });
+  return { ok: true };
+}
+
+/**
+ * Cycle a task's execution position: retained topic → group top level → fresh
+ * topic per run → the task's own dedicated topic → group top level (a
+ * materialized dedicated topic starts from the retained-topic state). Silent
+ * tasks skip the fresh-topic state because that state needs a visible seed
+ * message. The `deliver` response remains for cached clients.
+ */
+export function toggleDelivery(id: string): {
+  ok: boolean;
+  error?: string;
+  deliver?: 'origin' | 'new-topic';
+  executionPosition?: ScheduleExecutionPosition;
+} {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
+  const current = resolveTaskExecutionPosition(task);
+  let executionPosition: ScheduleExecutionPosition;
+  if (current === 'topic') executionPosition = 'top-level';
+  else if (current === 'top-level') executionPosition = 'new-topic';
+  else if (current === 'new-topic') {
+    // Same multi-chat refusal addTask/updateTask enforce: the dedicated-task
+    // position is single-chat only. The body-less delivery toggle is a legacy
+    // compatibility route and must not persist 'task' for a multi-chat task —
+    // the next fire would run a single-chat dedicated task per target and let
+    // them race on the shared rootMessageId.
+    const targets = scheduleStore.normalizeScheduleChatTargets({
+      chatId: task.chatId,
+      chatIds: task.chatIds ?? null,
+    });
+    if ((targets.chatIds ?? [targets.chatId]).length > 1) {
+      return { ok: false, error: 'multiple_chats_task_unsupported' };
+    }
+    executionPosition = 'task';
+  }
+  // A dedicated task parks at top level. The retained root is never reused to
+  // cycle back into a topic silently — that was the adopt-topic leak.
+  else executionPosition = 'top-level';
+  if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
+  // 'topic' is never a toggle target; the dedicated-task position owns a
+  // (possibly not-yet-materialized) thread, everything else lands in chat.
+  const scope: 'chat' | 'thread' = executionPosition === 'task' ? 'thread' : 'chat';
+  // Parking at top level clears the retained root bookmark; entering the
+  // dedicated-task position also starts rootless even if a stale root lingers
+  // (undefined in the store; null in the dashboard event so JSON/SSE caches
+  // clear it too) — its own root is written back by the first fire.
+  const clearsRoot = executionPosition !== 'new-topic' && task.rootMessageId !== undefined;
+  scheduleStore.updateTask(id, clearsRoot
+    ? { scope, executionPosition, rootMessageId: undefined }
+    : { scope, executionPosition });
+  const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: clearsRoot ? { scope, executionPosition, rootMessageId: null } : { scope, executionPosition } },
+  });
+  return { ok: true, deliver, executionPosition };
+}
+
+/**
+ * Update editable fields of a scheduled task (name, prompt, schedule, silent,
+ * execution targets, position and retained topic root).
+ * Re-parses the schedule expression and recomputes nextRunAt when the schedule
+ * string changes. A legacy `deliver` input is accepted and normalized to
+ * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
+ * explicit fresh-topic position for cached clients.
+ * Emits a `schedule.updated` event so the dashboard reflects changes live.
+ */
+export function updateTask(
+  id: string,
+  updates: {
+    name?: string;
+    prompt?: string;
+    schedule?: string;
+    deliver?: 'origin' | 'new-topic';
+    silent?: boolean;
+    executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
+    topicTitle?: string;
+    followActive?: boolean;
+    chatId?: string;
+    chatIds?: readonly string[] | null;
+    /** `''` / `null` clears the per-task model and falls back to the bot's. */
+    model?: string | null;
+    reasoningEffort?: ScheduleReasoningEffort | null;
+  },
+  options: { deferEvent?: boolean } = {},
+): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+
+  const patch: Record<string, unknown> = {};
+  const eventPatch: Record<string, unknown> = {};
+  if (updates.name !== undefined) patch.name = updates.name;
+  if (updates.prompt !== undefined) patch.prompt = updates.prompt;
+  if (updates.silent !== undefined) {
+    patch.silent = updates.silent === true ? true : undefined;
+    eventPatch.silent = updates.silent === true;
+  }
+  // `null` (and an all-whitespace model) is the documented way to clear the
+  // per-task override; `undefined` leaves whatever the task already has.
+  if (updates.model !== undefined) {
+    patch.model = updates.model?.trim() || undefined;
+    // JSON/SSE omit undefined, so clearing must travel as null or a cached
+    // dashboard row keeps showing the model the user just removed.
+    eventPatch.model = patch.model ?? null;
+  }
+  if (updates.reasoningEffort !== undefined) {
+    patch.reasoningEffort = updates.reasoningEffort ?? undefined;
+    eventPatch.reasoningEffort = patch.reasoningEffort ?? null;
+  }
+
+  const legacyPosition = updates.deliver === 'new-topic'
+    ? 'new-topic'
+    : undefined;
+  const executionPosition = updates.executionPosition ?? legacyPosition;
+  const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+  let targets: scheduleStore.ScheduleChatTargets;
+  try {
+    targets = targetUpdate
+      ? scheduleStore.normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : { chatId: task.chatId, chatIds: task.chatIds };
+    if (targetUpdate) {
+      assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId], task.chatIds ?? [task.chatId]);
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  // A stored task-position row projects to 'topic' once its first-fire root
+  // exists (API projection), but edits must keep the dedicated-task semantics:
+  // no user-settable root and the chat-change rule belongs to task, not topic.
+  const storedPosition: ScheduleExecutionPosition = task.executionPosition === 'task'
+    ? 'task'
+    : resolveTaskExecutionPosition(task);
+  const finalExecutionPosition = executionPosition ?? storedPosition;
+  const targetChatIds = targets.chatIds ?? [targets.chatId];
+  if (finalExecutionPosition === 'topic' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_topic_unsupported' };
+  }
+  if (finalExecutionPosition === 'task' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_task_unsupported' };
+  }
+  const primaryChatChanged = targetUpdate && targets.chatId !== task.chatId;
+  const explicitRootMessageId = updates.rootMessageId?.trim();
+  const nextRootMessageId = primaryChatChanged
+    ? explicitRootMessageId
+    : updates.rootMessageId ?? task.rootMessageId;
+  if (finalExecutionPosition === 'topic' && !nextRootMessageId) {
+    return { ok: false, error: 'topic_root_required' };
+  }
+  // A task-position root is owned by the runtime (first fire / restart
+  // recovery writeback) — clients may never inject one.
+  if (finalExecutionPosition === 'task' && explicitRootMessageId) {
+    return { ok: false, error: 'task_root_not_user_settable' };
+  }
+  const nextPosition = finalExecutionPosition;
+  const nextFollowActive = updates.followActive ?? task.followActive;
+  if (updates.followActive === true && nextPosition !== 'topic') {
+    return { ok: false, error: 'follow_active_requires_topic' };
+  }
+  if (updates.followActive !== undefined) {
+    patch.followActive = updates.followActive === true ? true : undefined;
+    eventPatch.followActive = updates.followActive === true;
+  }
+  if (nextFollowActive === true && nextPosition !== 'topic') {
+    // Moving a follow-active task away from topic execution drops the flag:
+    // there is no topic to follow at top level / new-topic.
+    patch.followActive = undefined;
+    eventPatch.followActive = false;
+  }
+  if (targetUpdate) {
+    patch.chatId = targets.chatId;
+    patch.chatIds = targets.chatIds;
+    eventPatch.chatId = targets.chatId;
+    // JSON/SSE omit undefined, so null is required to clear a cached prior
+    // multi-chat array when an edit collapses back to one target.
+    eventPatch.chatIds = targets.chatIds ?? null;
+  }
+  if (updates.topicTitle !== undefined) {
+    try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+  }
+  // A user-supplied root for a task-position task is rejected above when
+  // non-empty; an empty/whitespace patch must not be written either — the
+  // first-fire root is runtime-managed.
+  if (updates.rootMessageId !== undefined && finalExecutionPosition !== 'task') {
+    patch.rootMessageId = updates.rootMessageId;
+  }
+  if (executionPosition !== undefined) {
+    patch.scope = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
+    patch.executionPosition = executionPosition;
+    patch.deliver = 'origin';
+    if (executionPosition === 'task') {
+      // Entering task position from another position drops any foreign root so
+      // the first fire creates this task's own topic. Re-saving a task that
+      // already owns its materialized root keeps it untouched.
+      if (task.executionPosition !== 'task' && task.rootMessageId !== undefined) {
+        patch.rootMessageId = undefined;
+        eventPatch.rootMessageId = null;
+      }
+    } else if (executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      // Parking at top level (or fresh topic) clears the retained root bookmark
+      // so execution can never silently return to the originating (e.g. adopted)
+      // topic — even when the client carries a stale root (dashboard edit form).
+      patch.rootMessageId = undefined;
+      eventPatch.rootMessageId = null;
+    }
+  } else if (updates.deliver !== undefined) {
+    patch.deliver = 'origin';
+  }
+  if (primaryChatChanged && finalExecutionPosition !== 'topic' && task.rootMessageId !== undefined) {
+    patch.rootMessageId = undefined;
+    eventPatch.rootMessageId = null;
+  }
+
+  // Re-parse + recompute next run when the schedule expression changes.
+  if (updates.schedule !== undefined && updates.schedule !== task.schedule) {
+    let parsed: ParsedSchedule;
+    try {
+      parsed = parseSchedule(updates.schedule);
+    } catch (err) {
+      return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    patch.schedule = updates.schedule;
+    patch.parsed = parsed;
+    const next = computeNextRun(parsed);
+    patch.nextRunAt = next ?? undefined;
+  }
+
+  if (!scheduleStore.updateTask(id, patch)) return { ok: false, error: 'not_found' };
+  const publishedPatch = { ...patch, ...eventPatch };
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  publishScheduleTaskUpdated(id, publishedPatch);
+  return { ok: true };
+}
+
+/** Publish a task patch after a compound configuration operation has fully
+ * committed. Keeping this separate lets the protected-precondition wrapper
+ * roll back its task row without first exposing a transient target change. */
+export function publishScheduleTaskUpdated(
+  id: string,
+  patch: Record<string, unknown>,
+): void {
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch },
+  });
+}
+
+/**
+ * Delete a scheduled task. Emits a `schedule.deleted` event so the dashboard
+ * drops the row immediately without waiting for the next poll.
+ */
+export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
+  if (!removeTask(id)) return { ok: false, error: 'not_found' };
+  dashboardEventBus.publish({
+    type: 'schedule.deleted',
+    body: { id },
+  });
+  return { ok: true };
+}
