@@ -13,6 +13,7 @@
 #   BOTWX_HOME         installation root (default: ~/.botwx)
 #   BOTWX_INSTALL_DIR  executable directory (default: $BOTWX_HOME/bin)
 #   BOTWX_ARCHIVE_URL  archive override for mirrors/testing
+#   BOTWX_BUN_INSTALL_URL  Bun installer override for mirrors/testing
 set -eu
 
 REPO="${BOTWX_REPO:-0x8u/botwx}"
@@ -44,7 +45,6 @@ esac
 command -v curl >/dev/null 2>&1 || err "curl is required"
 command -v tar >/dev/null 2>&1 || err "tar is required"
 command -v node >/dev/null 2>&1 || err "Node.js 22+ is required: https://nodejs.org/"
-command -v bun >/dev/null 2>&1 || err "Bun 1.4.2 is required: https://bun.sh/"
 
 node_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || printf 0)"
 case "$node_major" in
@@ -52,16 +52,11 @@ case "$node_major" in
 esac
 [ "$node_major" -ge 22 ] || err "Node.js 22+ is required (found $(node --version 2>/dev/null || printf unknown))"
 
-bun_version="$(bun --version 2>/dev/null || true)"
-if [ "$bun_version" != "1.4.2" ]; then
-  printf '%s\n' "⚠️  project is pinned to Bun 1.4.2; found ${bun_version:-unknown}. Continuing with the installed Bun."
-fi
-
 mkdir -p "$BOTWX_ROOT" "$BIN_DIR"
 chmod 700 "$BOTWX_ROOT" 2>/dev/null || true
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/botwx-install.XXXXXX")"
-stage="$(mktemp -d "$BOTWX_ROOT/.app-stage.XXXXXX")"
+stage=''
 cleanup() {
   rm -rf "$work"
   if [ -n "$stage" ]; then
@@ -69,6 +64,31 @@ cleanup() {
   fi
 }
 trap cleanup EXIT HUP INT TERM
+
+if ! command -v bun >/dev/null 2>&1; then
+  command -v bash >/dev/null 2>&1 || err "bash is required to install Bun automatically"
+  bun_install_root="${BUN_INSTALL:-$HOME/.bun}"
+  case "$bun_install_root" in
+    ''|/) err "refusing unsafe BUN_INSTALL '$bun_install_root'" ;;
+  esac
+  bun_install_url="${BOTWX_BUN_INSTALL_URL:-https://bun.com/install}"
+  bun_installer="$work/bun-install.sh"
+  printf '%s\n' "↓ Bun not found; installing Bun 1.4.2 ..."
+  curl -fL --retry 3 --connect-timeout 15 "$bun_install_url" -o "$bun_installer" \
+    || err "could not download the Bun installer: $bun_install_url"
+  BUN_INSTALL="$bun_install_root" bash "$bun_installer" "bun-v1.4.2" \
+    || err "could not install Bun 1.4.2"
+  PATH="$bun_install_root/bin:$PATH"
+  export PATH
+  command -v bun >/dev/null 2>&1 || err "Bun installed but was not found in $bun_install_root/bin"
+fi
+
+bun_version="$(bun --version 2>/dev/null || true)"
+if [ "$bun_version" != "1.4.2" ]; then
+  printf '%s\n' "⚠️  project is pinned to Bun 1.4.2; found ${bun_version:-unknown}. Continuing with the installed Bun."
+fi
+
+stage="$(mktemp -d "$BOTWX_ROOT/.app-stage.XXXXXX")"
 
 archive="$work/botwx.tar.gz"
 url="${BOTWX_ARCHIVE_URL:-https://github.com/$REPO/archive/$REF.tar.gz}"

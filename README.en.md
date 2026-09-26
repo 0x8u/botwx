@@ -34,7 +34,7 @@ for the trust, persistence, and failure boundaries.
 
 ## One-line install
 
-With Node.js 22+ and Bun 1.4.2 already installed:
+With Node.js 22+ installed (the installer bootstraps pinned Bun 1.4.2 when needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0x8u/botwx/main/install.sh | sh
@@ -42,7 +42,8 @@ curl -fsSL https://raw.githubusercontent.com/0x8u/botwx/main/install.sh | sh
 ~/.botwx/bin/botwx start
 ```
 
-`setup` detects an installed agent CLI, selects the workspace and session
+The installer downloads and builds Botwx, bootstrapping Bun 1.4.2 first when it
+is not already available. `setup` detects an installed agent CLI, selects the workspace and session
 backend, writes `~/.botwx/.env`, and starts WeChat QR login. Open a new terminal
 after installation to use the shorter `botwx` command directly.
 

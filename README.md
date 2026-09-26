@@ -33,7 +33,7 @@ Claude Code / Codex / Gemini / ...
 
 ## 一句话安装
 
-机器上先准备好 Node.js 22+ 和 Bun 1.4.2，然后执行：
+机器上只需准备好 Node.js 22+，然后执行（未安装 Bun 时会自动安装锁定的 1.4.2 版本）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0x8u/botwx/main/install.sh | sh
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/0x8u/botwx/main/install.sh | sh
 ~/.botwx/bin/botwx start   # 前台启动微信连接器和 Agent 内核
 ```
 
-安装器会下载 GitHub 源码快照、按 `bun.lock` 安装依赖、完成构建，并把
+安装器会自动补齐 Bun 1.4.2、下载 GitHub 源码快照、按 `bun.lock` 安装依赖、完成构建，并把
 `~/.botwx/bin` 写入 shell 的 PATH。新开终端后可以直接使用短命令：
 
 ```bash
@@ -49,8 +49,7 @@ botwx setup
 botwx start
 ```
 
-如果使用 fork，可以通过环境变量覆盖仓库和分支：
-让用户这样安装：
+如果使用 fork，可以通过环境变量覆盖仓库和分支，让用户这样安装：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/your-name/botwx/main/install.sh \
@@ -67,12 +66,13 @@ curl -fsSL https://raw.githubusercontent.com/your-name/botwx/main/install.sh \
 
 ### 第 1 步：确认运行环境（约 30 秒）
 
-需要 Node.js 22+、Bun 1.4.2、tmux，以及至少一个已经登录的 Agent CLI。默认使用
+需要 Node.js 22+、tmux，以及至少一个已经登录的 Agent CLI；Bun 1.4.2 可由安装器
+自动安装。默认使用
 `codex-app`，它仍然要求本机的 `codex` 命令已经安装并完成登录。
 
 ```bash
 node --version       # 应为 v22 或更高
-bun --version        # 推荐 1.4.2
+bun --version        # 可选；没有时一句话安装器会自动安装 1.4.2
 tmux -V              # 推荐安装，用于持久会话与崩溃恢复
 codex --version      # 使用默认 codex-app 时必须可执行
 ```
