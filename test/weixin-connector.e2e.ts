@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { start } from 'weixin-agent-sdk';
 import { BotwxWeixinAgent } from '../src/im/weixin/agent.js';
+import { readBotwxConfig } from '../src/im/weixin/config.js';
 import { ConversationRegistry } from '../src/im/weixin/conversation-registry.js';
 import { BotwxCoreClient } from '../src/im/weixin/core-client.js';
 
@@ -76,6 +77,16 @@ describe('WeChat connector end to end', () => {
       if (path === '/api/trigger') {
         coreRequest = await bodyOf(request) as Record<string, any>;
         response.setHeader('content-type', 'application/json');
+        const timeoutMs = coreRequest.options?.timeoutMs;
+        if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 300_000) {
+          response.statusCode = 400;
+          response.end(JSON.stringify({
+            ok: false,
+            errorCode: 'bad_request',
+            error: 'options.timeoutMs must be between 1000 and 300000',
+          }));
+          return;
+        }
         response.end(JSON.stringify({ ok: true, output: { content: '**Botwx E2E OK**' } }));
         return;
       }
@@ -102,10 +113,11 @@ describe('WeChat connector end to end', () => {
       userId: 'wx-user-e2e',
     }));
 
+    const config = readBotwxConfig({}, { cwd: root, homeDir: root });
     const core = new BotwxCoreClient({
       baseUrl,
       botId: 'local_botwx',
-      timeoutMs: 5_000,
+      timeoutMs: config.turnTimeoutMs,
     });
     const agent = new BotwxWeixinAgent({
       core,
@@ -131,6 +143,7 @@ describe('WeChat connector end to end', () => {
     });
     expect(coreRequest?.source.requestId).toMatch(/^hl_wx_[A-Za-z0-9_-]{43}$/);
     expect(coreRequest?.envelope.rawText).toBe('请完成端到端测试');
+    expect(coreRequest?.options.timeoutMs).toBe(300_000);
     expect(sentMessage?.msg.to_user_id).toBe('wx-user-e2e');
     expect(sentMessage?.msg.context_token).toBe('ctx-e2e');
     expect(sentMessage?.msg.item_list[0].text_item.text).toBe('Botwx E2E OK');

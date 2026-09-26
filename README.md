@@ -244,7 +244,7 @@ bun run dev
 | `BOTWX_WORKING_DIR` | 当前目录 | Agent 工作目录 |
 | `BOTWX_MODEL` | Agent 默认 | 模型覆盖 |
 | `BOTWX_REASONING_EFFORT` | 未设置 | `low` / `medium` / `high` / `xhigh` / `max` / `ultra` |
-| `BOTWX_TURN_TIMEOUT_MS` | `1800000` | 微信单轮请求超时 |
+| `BOTWX_TURN_TIMEOUT_MS` | `300000` | 微信单轮请求超时（范围 1000–300000 毫秒） |
 | `BOTWX_STATE_DIR` | `~/.botwx` | 对话映射与 SDK 凭据根目录 |
 | `BOTWX_ENGINE_STATE_DIR` | `<state>/engine` | 执行内核持久化目录 |
 | `BOTWX_WEIXIN_STATE_DIR` | `<state>` | `weixin-agent-sdk` 凭据与同步游标目录 |

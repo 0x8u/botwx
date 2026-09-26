@@ -2,7 +2,9 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 export const BOTWX_DEFAULT_API_PORT = 7960;
-export const BOTWX_DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
+export const BOTWX_MIN_TURN_TIMEOUT_MS = 1_000;
+export const BOTWX_MAX_TURN_TIMEOUT_MS = 300_000;
+export const BOTWX_DEFAULT_TURN_TIMEOUT_MS = BOTWX_MAX_TURN_TIMEOUT_MS;
 
 export type BotwxReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
@@ -30,11 +32,12 @@ function positiveInteger(
   fallback: number,
   name: string,
   max = Number.MAX_SAFE_INTEGER,
+  min = 1,
 ): number {
   if (value === undefined || value.trim() === '') return fallback;
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
-    throw new Error(`${name} must be an integer between 1 and ${max}; got ${value}`);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}; got ${value}`);
   }
   return parsed;
 }
@@ -82,7 +85,8 @@ export function readBotwxConfig(
       env.BOTWX_TURN_TIMEOUT_MS,
       BOTWX_DEFAULT_TURN_TIMEOUT_MS,
       'BOTWX_TURN_TIMEOUT_MS',
-      2_147_483_647,
+      BOTWX_MAX_TURN_TIMEOUT_MS,
+      BOTWX_MIN_TURN_TIMEOUT_MS,
     ),
     weixinStateDir: absolutePath(env.BOTWX_WEIXIN_STATE_DIR, stateDir, cwd),
     workingDir: absolutePath(env.BOTWX_WORKING_DIR, cwd, cwd),
