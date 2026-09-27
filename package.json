@@ -56,7 +56,7 @@
     "switch:here": "bun run build && bun run use:here",
     "test": "vitest run --project unit",
     "test:all": "vitest run",
-    "test:unit:weixin": "vitest run --project unit test/weixin-config.test.ts test/weixin-core-only-environment.test.ts test/weixin-conversation-registry.test.ts test/weixin-core-client.test.ts test/weixin-agent.test.ts test/weixin-setup.test.ts test/botwx-install-script.test.ts",
+    "test:unit:weixin": "vitest run --project unit test/weixin-config.test.ts test/weixin-core-only-environment.test.ts test/weixin-conversation-registry.test.ts test/weixin-core-client.test.ts test/weixin-agent.test.ts test/weixin-scheduler.test.ts test/weixin-setup.test.ts test/botwx-install-script.test.ts",
     "test:e2e": "vitest run --project e2e",
     "test:e2e:weixin": "vitest run --project e2e test/weixin-connector.e2e.ts",
     "test:bun": "node scripts/run-bun-tests.mjs",

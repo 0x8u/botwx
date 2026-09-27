@@ -9,10 +9,12 @@ import { readBotwxConfig, type BotwxConfig } from './config.js';
 import { ConversationRegistry } from './conversation-registry.js';
 import { BotwxCoreClient } from './core-client.js';
 import { prepareBotwxCoreEnvironment } from './core-only-environment.js';
+import { BotwxScheduler } from './scheduler.js';
 
 export interface RunningBotwx {
   bot: Bot;
   config: BotwxConfig;
+  scheduler: BotwxScheduler;
 }
 export async function startBotwx(config = readBotwxConfig()): Promise<RunningBotwx> {
   prepareBotwxCoreEnvironment(config);
@@ -35,9 +37,17 @@ export async function startBotwx(config = readBotwxConfig()): Promise<RunningBot
   await core.waitUntilReady();
 
   const conversations = new ConversationRegistry(join(config.stateDir, 'conversations.json'));
-  const agent = new BotwxWeixinAgent({ core, conversations });
+  const scheduler = new BotwxScheduler({
+    filePath: join(config.stateDir, 'weixin-schedules.json'),
+    timeZone: config.scheduleTimeZone,
+    log: message => console.log(message),
+  });
+  const agent = new BotwxWeixinAgent({ core, conversations, scheduler });
   const abortController = new AbortController();
-  const stopMonitor = () => abortController.abort();
+  const stopMonitor = () => {
+    scheduler.stop();
+    abortController.abort();
+  };
   process.once('SIGTERM', stopMonitor);
   process.once('SIGINT', stopMonitor);
 
@@ -46,5 +56,10 @@ export async function startBotwx(config = readBotwxConfig()): Promise<RunningBot
     abortSignal: abortController.signal,
     log: message => console.log(message),
   });
-  return { bot, config };
+  scheduler.setHandlers(
+    task => agent.runScheduled(task.sessionId, task.prompt),
+    message => bot.sendMessage(message),
+  );
+  scheduler.start();
+  return { bot, config, scheduler };
 }

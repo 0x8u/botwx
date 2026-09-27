@@ -16,10 +16,21 @@ export interface BotwxConfig {
   engineStateDir: string;
   model?: string;
   reasoningEffort?: BotwxReasoningEffort;
+  scheduleTimeZone: string;
   stateDir: string;
   turnTimeoutMs: number;
   weixinStateDir: string;
   workingDir: string;
+}
+
+function timeZone(value: string | undefined): string {
+  const selected = nonBlank(value) ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: selected }).format();
+    return selected;
+  } catch {
+    throw new Error(`BOTWX_TIMEZONE must be a valid IANA time zone; got ${selected}`);
+  }
 }
 
 function nonBlank(value: string | undefined): string | undefined {
@@ -80,6 +91,7 @@ export function readBotwxConfig(
     engineStateDir: absolutePath(env.BOTWX_ENGINE_STATE_DIR, join(stateDir, 'engine'), cwd),
     model: nonBlank(env.BOTWX_MODEL),
     reasoningEffort: reasoningEffort(env.BOTWX_REASONING_EFFORT),
+    scheduleTimeZone: timeZone(env.BOTWX_TIMEZONE),
     stateDir,
     turnTimeoutMs: positiveInteger(
       env.BOTWX_TURN_TIMEOUT_MS,

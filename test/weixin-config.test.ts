@@ -51,4 +51,9 @@ describe('readBotwxConfig', () => {
     );
     expect(config.workingDir).toBe('/work/repo/packages/service');
   });
+
+  it('accepts an explicit schedule time zone and rejects invalid zones', () => {
+    expect(readBotwxConfig({ BOTWX_TIMEZONE: 'Asia/Shanghai' }).scheduleTimeZone).toBe('Asia/Shanghai');
+    expect(() => readBotwxConfig({ BOTWX_TIMEZONE: 'Mars/Olympus' })).toThrow(/BOTWX_TIMEZONE/);
+  });
 });

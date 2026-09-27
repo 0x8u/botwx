@@ -70,6 +70,24 @@ bun run dev
 Send `/clear` in WeChat to rotate to a fresh model session without deleting the
 previous session's audit data.
 
+## WeChat schedules
+
+Botwx owns WeChat schedules directly; they do not depend on the legacy Botmux
+MCP or any Lark topic. Create and manage them from WeChat:
+
+```text
+/schedule 每天 23:00 Generate today's market review
+/schedule add 0 23 * * * | Generate today's market review
+/schedule list
+/schedule run|pause|resume|remove <task-id>
+```
+
+Runs use a dedicated reusable Agent session and proactively return the final
+text through WeChat. If the SDK's roughly 24-hour inbound `context_token` is
+temporarily unavailable, the completed result is persisted with mode `0600`
+and delivered after the next inbound message. Set `BOTWX_TIMEZONE` to an IANA
+zone such as `Asia/Shanghai`; otherwise the host time zone is used.
+
 Configuration is read from `~/.botwx/.env`, falling back to `.env` in the
 current directory. See [.env.example](.env.example) for all supported options.
 

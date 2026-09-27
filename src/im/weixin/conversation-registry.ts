@@ -45,10 +45,17 @@ export class ConversationRegistry {
   sessionIdFor(conversationId: string): string {
     const normalized = conversationId.trim();
     if (!normalized) throw new Error('WeChat conversationId must not be empty');
-    const key = sha256(normalized);
+    const key = this.conversationKeyFor(normalized);
     const generation = this.generations[key] ?? 0;
     // Botmux headless ids must match /^hl_[A-Za-z0-9_-]{8,128}$/.
     return `hl_wx_${sha256(`${key}:${generation}`).slice(0, 43)}`;
+  }
+
+  /** Stable privacy-preserving owner key for connector-owned sidecars. */
+  conversationKeyFor(conversationId: string): string {
+    const normalized = conversationId.trim();
+    if (!normalized) throw new Error('WeChat conversationId must not be empty');
+    return sha256(normalized);
   }
 
   rotate(conversationId: string): string {

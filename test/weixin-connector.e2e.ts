@@ -8,6 +8,7 @@ import { BotwxWeixinAgent } from '../src/im/weixin/agent.js';
 import { readBotwxConfig } from '../src/im/weixin/config.js';
 import { ConversationRegistry } from '../src/im/weixin/conversation-registry.js';
 import { BotwxCoreClient } from '../src/im/weixin/core-client.js';
+import { BotwxScheduler } from '../src/im/weixin/scheduler.js';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -147,5 +148,128 @@ describe('WeChat connector end to end', () => {
     expect(sentMessage?.msg.to_user_id).toBe('wx-user-e2e');
     expect(sentMessage?.msg.context_token).toBe('ctx-e2e');
     expect(sentMessage?.msg.item_list[0].text_item.text).toBe('Botwx E2E OK');
+  });
+
+  it('creates a native schedule from WeChat and proactively returns its due result', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botwx-schedule-e2e-'));
+    roots.push(root);
+    process.env.OPENCLAW_STATE_DIR = root;
+
+    let updateDelivered = false;
+    let coreRequest: Record<string, any> | undefined;
+    const sentTexts: string[] = [];
+    let resolveCreated!: () => void;
+    let resolveReport!: () => void;
+    const created = new Promise<void>(resolve => { resolveCreated = resolve; });
+    const reported = new Promise<void>(resolve => { resolveReport = resolve; });
+
+    const server = createServer(async (request, response) => {
+      const path = request.url ?? '';
+      if (path === '/ilink/bot/getupdates') {
+        await bodyOf(request);
+        response.setHeader('content-type', 'application/json');
+        if (!updateDelivered) {
+          updateDelivered = true;
+          response.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: 'cursor-schedule',
+            msgs: [{
+              from_user_id: 'wx-user-schedule',
+              create_time_ms: Date.now(),
+              context_token: 'ctx-schedule',
+              item_list: [{
+                type: 1,
+                text_item: {
+                  text: '帮我写一个定时任务，每天晚上11点执行，用钉钉 dws cli 生成市场信号评分',
+                },
+              }],
+            }],
+          }));
+        } else {
+          response.end(JSON.stringify({ ret: 0, get_updates_buf: 'cursor-schedule', msgs: [] }));
+        }
+        return;
+      }
+      if (path === '/ilink/bot/getconfig') {
+        await bodyOf(request);
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ ret: 0, typing_ticket: '' }));
+        return;
+      }
+      if (path === '/api/trigger') {
+        coreRequest = await bodyOf(request) as Record<string, any>;
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ ok: true, output: { content: '五市场 TOP 机会与评分' } }));
+        return;
+      }
+      if (path === '/ilink/bot/sendmessage') {
+        const body = await bodyOf(request) as Record<string, any>;
+        const text = String(body.msg?.item_list?.[0]?.text_item?.text ?? '');
+        sentTexts.push(text);
+        response.setHeader('content-type', 'application/json');
+        response.end('{}');
+        if (text.includes('已创建微信定时任务')) resolveCreated();
+        if (text.includes('五市场 TOP 机会与评分')) resolveReport();
+        return;
+      }
+      response.statusCode = 404;
+      response.end();
+    });
+    servers.push(server);
+    const port = await listen(server);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const accountRoot = join(root, 'openclaw-weixin');
+    mkdirSync(join(accountRoot, 'accounts'), { recursive: true });
+    writeFileSync(join(accountRoot, 'accounts.json'), JSON.stringify(['schedule-account']));
+    writeFileSync(join(accountRoot, 'accounts', 'schedule-account.json'), JSON.stringify({
+      token: 'test-token',
+      baseUrl,
+      userId: 'wx-user-schedule',
+    }));
+
+    let clock = new Date('2026-09-27T12:00:00.000Z');
+    const scheduler = new BotwxScheduler({
+      filePath: join(root, 'weixin-schedules.json'),
+      timeZone: 'Asia/Shanghai',
+      now: () => clock,
+    });
+    const core = new BotwxCoreClient({ baseUrl, botId: 'local_botwx', timeoutMs: 5_000 });
+    const agent = new BotwxWeixinAgent({
+      core,
+      scheduler,
+      conversations: new ConversationRegistry(join(root, 'conversations.json')),
+    });
+    const abortController = new AbortController();
+    const bot = start(agent, {
+      accountId: 'schedule-account',
+      abortSignal: abortController.signal,
+      log: () => undefined,
+    });
+    scheduler.setHandlers(
+      task => agent.runScheduled(task.sessionId, task.prompt),
+      message => bot.sendMessage(message),
+    );
+
+    await Promise.race([
+      created,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timed out waiting for schedule creation')), 10_000)),
+    ]);
+    expect(coreRequest).toBeUndefined();
+    expect(scheduler.list()).toHaveLength(1);
+
+    clock = new Date('2026-09-27T15:00:01.000Z');
+    await scheduler.runDueTasks(clock);
+    await Promise.race([
+      reported,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timed out waiting for proactive report')), 10_000)),
+    ]);
+    abortController.abort();
+    await bot.wait();
+
+    expect(coreRequest?.envelope.rawText).toContain('Botwx 微信连接器');
+    expect(coreRequest?.envelope.rawText).toContain('钉钉 dws cli');
+    expect(sentTexts.some(text => text.includes('已创建微信定时任务'))).toBe(true);
+    expect(sentTexts.some(text => text.includes('五市场 TOP 机会与评分'))).toBe(true);
+    expect(scheduler.list()[0]).toMatchObject({ lastStatus: 'ok' });
   });
 });

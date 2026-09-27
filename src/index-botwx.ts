@@ -19,6 +19,7 @@ const HELP = `botwx — 微信 ↔ AI 编程 Agent
   BOTWX_MODEL               可选模型覆盖
   BOTWX_REASONING_EFFORT    low|medium|high|xhigh|max|ultra
   BOTWX_TURN_TIMEOUT_MS     单轮超时，范围 1000–300000，默认 300000
+  BOTWX_TIMEZONE            微信定时任务时区，默认跟随系统
   BOTWX_STATE_DIR           状态目录，默认 ~/.botwx
   BOTWX_ACCOUNT_ID          多账号时显式选择账号
 `;

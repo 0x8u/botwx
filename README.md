@@ -206,6 +206,34 @@ botwx start
 发送 `/clear` 会切换到全新会话，旧历史不会被破坏性删除。按 `Ctrl+C` 可以安全停止
 Botwx，再次执行 `start` 即可恢复服务。
 
+### 微信定时任务
+
+定时任务由 Botwx 连接器直接管理，不依赖 Agent CLI 内的 Botmux MCP，也不会走飞书
+话题。可以直接在微信中使用自然语言创建：
+
+```text
+帮我写一个定时任务，每天晚上11点执行，用钉钉 dws cli 查询今日市场信号并生成评分报告
+```
+
+Botwx 会立即返回任务 ID、时区和下次执行时间。到点后任务在独立、可持续复用的 Agent
+会话中运行，最终文本由微信 ClawBot 主动发送。管理命令如下：
+
+```text
+/schedule list
+/schedule 每天 23:00 生成今日市场复盘
+/schedule add 0 23 * * * | 生成今日市场复盘
+/schedule run <任务ID>
+/schedule pause <任务ID>
+/schedule resume <任务ID>
+/schedule remove <任务ID>
+```
+
+任务保存在权限为 `0600` 的 `~/.botwx/weixin-schedules.json`，原始微信用户 ID 不会
+落盘。微信主动消息依赖 SDK 最近收到的 `context_token`（通常约 24 小时有效）；如果
+Botwx 重启后暂时没有可用令牌，任务仍会执行，结果会安全暂存，并在用户下一次给
+ClawBot 发消息后自动补发。默认使用系统时区，可通过 `BOTWX_TIMEZONE=Asia/Shanghai`
+明确指定。
+
 ### 日常命令
 
 ```bash
@@ -245,6 +273,7 @@ bun run dev
 | `BOTWX_MODEL` | Agent 默认 | 模型覆盖 |
 | `BOTWX_REASONING_EFFORT` | 未设置 | `low` / `medium` / `high` / `xhigh` / `max` / `ultra` |
 | `BOTWX_TURN_TIMEOUT_MS` | `300000` | 微信单轮请求超时（范围 1000–300000 毫秒） |
+| `BOTWX_TIMEZONE` | 系统时区 | 微信定时任务时区（IANA 名称，如 `Asia/Shanghai`） |
 | `BOTWX_STATE_DIR` | `~/.botwx` | 对话映射与 SDK 凭据根目录 |
 | `BOTWX_ENGINE_STATE_DIR` | `<state>/engine` | 执行内核持久化目录 |
 | `BOTWX_WEIXIN_STATE_DIR` | `<state>` | `weixin-agent-sdk` 凭据与同步游标目录 |

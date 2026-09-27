@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BotwxWeixinAgent } from '../src/im/weixin/agent.js';
 import { ConversationRegistry } from '../src/im/weixin/conversation-registry.js';
 import type { BotwxCoreClient } from '../src/im/weixin/core-client.js';
+import type { BotwxScheduler } from '../src/im/weixin/scheduler.js';
 
 const roots: string[] = [];
 
@@ -61,5 +62,28 @@ describe('BotwxWeixinAgent', () => {
     releaseFirst();
     await Promise.all([first, second]);
     expect(order).toEqual(['start:one', 'end:one', 'start:two', 'end:two']);
+  });
+
+  it('handles connector-native schedules without asking the Agent CLI', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botwx-agent-'));
+    roots.push(root);
+    const core = { chat: vi.fn() } as unknown as BotwxCoreClient;
+    const scheduler = {
+      noteInbound: vi.fn(async () => undefined),
+      handleMessage: vi.fn(async () => '✅ 已创建微信定时任务 [1234abcd]'),
+    } as unknown as BotwxScheduler;
+    const agent = new BotwxWeixinAgent({
+      core,
+      scheduler,
+      conversations: new ConversationRegistry(join(root, 'conversations.json')),
+    });
+
+    await expect(agent.chat({
+      conversationId: 'wx-user',
+      text: '帮我写一个定时任务，每天晚上11点执行，生成市场复盘',
+    })).resolves.toEqual({ text: '✅ 已创建微信定时任务 [1234abcd]' });
+    expect(scheduler.noteInbound).toHaveBeenCalledOnce();
+    expect(scheduler.handleMessage).toHaveBeenCalledOnce();
+    expect(core.chat).not.toHaveBeenCalled();
   });
 });
