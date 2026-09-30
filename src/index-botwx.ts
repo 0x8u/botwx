@@ -10,13 +10,13 @@ const HELP = `botwx — 微信 ↔ AI 编程 Agent
   botwx setup     选择 Agent/工作目录并扫码连接微信
   botwx login     扫码登录微信
   botwx start     前台启动微信连接器与 Agent 内核
-  botwx status    检查微信登录状态
+  botwx status    检查微信登录状态与生效的 Agent/模型配置
   botwx logout    删除 weixin-agent-sdk 登录凭据
 
 常用环境变量:
   BOTWX_CLI                 Agent 适配器，默认 codex-app
   BOTWX_WORKING_DIR         Agent 工作目录，默认当前目录
-  BOTWX_MODEL               可选模型覆盖
+  BOTWX_MODEL               可选模型覆盖；Claude Code 默认 claude-sonnet-5-5
   BOTWX_REASONING_EFFORT    low|medium|high|xhigh|max|ultra
   BOTWX_TURN_TIMEOUT_MS     单轮超时，范围 1000–300000，默认 300000
   BOTWX_TIMEZONE            微信定时任务时区，默认跟随系统
@@ -51,8 +51,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === 'status') {
-    console.log(isLoggedIn() ? '✅ 微信已登录' : '❌ 微信未登录');
-    process.exitCode = isLoggedIn() ? 0 : 1;
+    const loggedIn = isLoggedIn();
+    console.log(loggedIn ? '✅ 微信已登录' : '❌ 微信未登录');
+    console.log(`Agent: ${config.cliId}`);
+    console.log(`模型配置: ${config.model ?? 'Agent 默认'}`);
+    process.exitCode = loggedIn ? 0 : 1;
     return;
   }
   if (command !== 'start') {
@@ -61,7 +64,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const { startBotwx } = await import('./im/weixin/runtime.js');
   const { bot } = await startBotwx(config);
-  console.log(`✅ botwx 已启动（${config.cliId} · 127.0.0.1:${config.apiPort}）`);
+  console.log(`✅ botwx 已启动（${config.cliId} · ${config.model ?? 'Agent 默认'} · 127.0.0.1:${config.apiPort}）`);
   await bot.wait();
 }
 

@@ -272,7 +272,12 @@ export async function runBotwxSetup(
     env.OPENCLAW_STATE_DIR = config.weixinStateDir;
 
     io.write(`\n✅ 配置已写入 ${envPath}\n`);
-    io.write(`   CLI: ${cli.id}\n   工作目录: ${workingDir}\n   后端: ${backend}\n`);
+    io.write(
+      `   CLI: ${cli.id}\n`
+      + `   模型: ${config.model ?? 'Agent 默认'}\n`
+      + `   工作目录: ${workingDir}\n`
+      + `   后端: ${backend}\n`,
+    );
 
     if (options.skipLogin) {
       io.write('   已跳过微信扫码；稍后运行 `botwx login`。\n');

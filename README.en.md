@@ -70,6 +70,26 @@ bun run dev
 Send `/clear` in WeChat to rotate to a fresh model session without deleting the
 previous session's audit data.
 
+### Claude Code and Sonnet 5.5
+
+When `BOTWX_CLI=claude-code`, Botwx now passes
+`--model claude-sonnet-5-5` by default. This prevents a persisted local
+preference or an older Claude Code default from silently selecting Sonnet 5.
+An explicit `BOTWX_MODEL` still takes precedence; set it to `sonnet` if you
+prefer Claude Code's rolling latest-Sonnet alias.
+
+After upgrading an existing installation, change any old explicit model value
+in `~/.botwx/.env`, restart Botwx, and send `/clear` in WeChat:
+
+```dotenv
+BOTWX_CLI=claude-code
+BOTWX_MODEL=claude-sonnet-5-5
+```
+
+Run `botwx status` to inspect the effective Agent and model configuration.
+Asking a model to identify itself is not a reliable version check because that
+answer is generated content and can use an outdated name.
+
 ## WeChat schedules
 
 Botwx owns WeChat schedules directly; they do not depend on the legacy Botmux

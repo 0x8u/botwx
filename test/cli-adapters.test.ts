@@ -461,6 +461,7 @@ describe('claude-code buildArgs', () => {
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('sonnet');
     expect(adapter.modelChoices).toContain('opus');
+    expect(adapter.modelChoices).toContain('claude-sonnet-5-5');
   });
 });
 

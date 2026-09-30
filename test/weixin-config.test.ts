@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BOTWX_DEFAULT_CLAUDE_CODE_MODEL,
   BOTWX_DEFAULT_API_PORT,
   BOTWX_DEFAULT_TURN_TIMEOUT_MS,
   BOTWX_MAX_TURN_TIMEOUT_MS,
@@ -21,6 +22,17 @@ describe('readBotwxConfig', () => {
       turnTimeoutMs: 300_000,
     });
     expect(config.turnTimeoutMs).toBe(BOTWX_DEFAULT_TURN_TIMEOUT_MS);
+    expect(config.model).toBeUndefined();
+  });
+
+  it('pins Claude Code to Sonnet 5.5 while preserving explicit model overrides', () => {
+    expect(readBotwxConfig({ BOTWX_CLI: 'claude-code' }).model)
+      .toBe(BOTWX_DEFAULT_CLAUDE_CODE_MODEL);
+    expect(readBotwxConfig({
+      BOTWX_CLI: 'claude-code',
+      BOTWX_MODEL: 'opus',
+    }).model).toBe('opus');
+    expect(readBotwxConfig({ BOTWX_CLI: 'codex-app' }).model).toBeUndefined();
   });
 
   it('rejects unsafe ids and invalid numeric inputs', () => {

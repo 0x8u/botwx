@@ -120,6 +120,9 @@ botwx setup
 4. 原子写入权限为 `0600` 的 `~/.botwx/.env`；
 5. 在尚未登录时显示微信二维码并等待扫码。
 
+选择 `claude-code` 时，Botwx 默认把 `--model claude-sonnet-5-5` 显式传给
+Claude Code，避免旧会话偏好或 Claude Code 的本机默认值继续选择 Sonnet 5。
+
 也可以无交互配置，适合服务器安装脚本：
 
 ```bash
@@ -260,6 +263,7 @@ bun run dev
 | 提示找不到 tmux | 安装 tmux，或在 `~/.botwx/.env` 中设置 `BACKEND_TYPE=pty` |
 | `EADDRINUSE` 或 7960 被占用 | 设置一个空闲端口，例如 `BOTWX_API_PORT=17960`，然后重启 |
 | Agent 看不到项目 | 确认 `BOTWX_WORKING_DIR` 是存在的绝对路径，并重启 Botwx |
+| Claude 自称还是 Sonnet 5 | 不要把模型的自我描述当作可靠检测；先运行 `botwx status` 查看生效配置，再在微信发送 `/clear` 创建使用新模型的会话 |
 | 想重新绑定微信 | 依次执行 `logout`、`login`，然后重新启动 |
 
 ## 配置
@@ -270,7 +274,7 @@ bun run dev
 |---|---:|---|
 | `BOTWX_CLI` | `codex-app` | 执行内核的 CLI 适配器 |
 | `BOTWX_WORKING_DIR` | 当前目录 | Agent 工作目录 |
-| `BOTWX_MODEL` | Agent 默认 | 模型覆盖 |
+| `BOTWX_MODEL` | Claude Code 为 `claude-sonnet-5-5`；其他 Agent 使用自身默认 | 模型覆盖；设为 `sonnet` 可跟随 Claude Code 的最新 Sonnet 别名 |
 | `BOTWX_REASONING_EFFORT` | 未设置 | `low` / `medium` / `high` / `xhigh` / `max` / `ultra` |
 | `BOTWX_TURN_TIMEOUT_MS` | `300000` | 微信单轮请求超时（范围 1000–300000 毫秒） |
 | `BOTWX_TIMEZONE` | 系统时区 | 微信定时任务时区（IANA 名称，如 `Asia/Shanghai`） |
@@ -279,6 +283,30 @@ bun run dev
 | `BOTWX_WEIXIN_STATE_DIR` | `<state>` | `weixin-agent-sdk` 凭据与同步游标目录 |
 | `BOTWX_ACCOUNT_ID` | SDK 第一个账号 | 多账号时选择账号 |
 | `BOTWX_API_PORT` | `7960` | 本机 core-only API 端口 |
+
+### Claude Code 升级到 Sonnet 5.5
+
+新版 Botwx 在 `BOTWX_CLI=claude-code` 且未设置 `BOTWX_MODEL` 时，会固定使用
+`claude-sonnet-5-5`。如果旧配置已经显式写了 Sonnet 5，请修改
+`~/.botwx/.env`：
+
+```dotenv
+BOTWX_CLI=claude-code
+BOTWX_MODEL=claude-sonnet-5-5
+```
+
+然后重启 Botwx，并在微信里发送一次 `/clear`。`/clear` 只切换到新的 Agent 会话，
+不会删除旧会话的审计记录。可在启动前用下面的命令核对：
+
+```bash
+botwx status
+# Agent: claude-code
+# 模型配置: claude-sonnet-5-5
+```
+
+直接问模型“你是什么版本”并不可靠；模型生成的自我描述可能沿用训练语料中的旧名称。
+Botwx 的可靠依据是 `status` 显示的配置，以及启动时实际传给 Claude Code 的
+`--model` 参数。
 
 ## 媒体消息
 

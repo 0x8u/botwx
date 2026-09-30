@@ -5,6 +5,14 @@ export const BOTWX_DEFAULT_API_PORT = 7960;
 export const BOTWX_MIN_TURN_TIMEOUT_MS = 1_000;
 export const BOTWX_MAX_TURN_TIMEOUT_MS = 300_000;
 export const BOTWX_DEFAULT_TURN_TIMEOUT_MS = BOTWX_MAX_TURN_TIMEOUT_MS;
+/** Pin Botwx's Claude Code bridge to the current Sonnet release.
+ *
+ * Keeping this explicit prevents a persisted Claude Code preference or a
+ * changed upstream CLI default from silently selecting an older model. Users
+ * can still override it with BOTWX_MODEL (including Claude Code's `sonnet`
+ * rolling alias if they prefer automatic future upgrades).
+ */
+export const BOTWX_DEFAULT_CLAUDE_CODE_MODEL = 'claude-sonnet-5-5';
 
 export type BotwxReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
@@ -82,14 +90,17 @@ export function readBotwxConfig(
   if (!/^local_[A-Za-z0-9._-]+$/.test(botId)) {
     throw new Error(`BOTWX_BOT_ID must match local_<slug>; got ${botId}`);
   }
+  const cliId = nonBlank(env.BOTWX_CLI) ?? 'codex-app';
+  const configuredModel = nonBlank(env.BOTWX_MODEL);
 
   return {
     accountId: nonBlank(env.BOTWX_ACCOUNT_ID),
     apiPort: positiveInteger(env.BOTWX_API_PORT, BOTWX_DEFAULT_API_PORT, 'BOTWX_API_PORT', 65_535),
     botId,
-    cliId: nonBlank(env.BOTWX_CLI) ?? 'codex-app',
+    cliId,
     engineStateDir: absolutePath(env.BOTWX_ENGINE_STATE_DIR, join(stateDir, 'engine'), cwd),
-    model: nonBlank(env.BOTWX_MODEL),
+    model: configuredModel
+      ?? (cliId === 'claude-code' ? BOTWX_DEFAULT_CLAUDE_CODE_MODEL : undefined),
     reasoningEffort: reasoningEffort(env.BOTWX_REASONING_EFFORT),
     scheduleTimeZone: timeZone(env.BOTWX_TIMEZONE),
     stateDir,

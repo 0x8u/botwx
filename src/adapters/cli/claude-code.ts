@@ -819,7 +819,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
-    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
+    // （`claude --help` 确认）；具体 ID 锁版本（包括 Sonnet 5.5）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');

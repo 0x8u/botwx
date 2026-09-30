@@ -118,5 +118,6 @@ describe('botwx setup', () => {
     expect(login).not.toHaveBeenCalled();
     expect(readFileSync(join(root, '.botwx', '.env'), 'utf8')).toContain('BACKEND_TYPE="pty"');
     expect(io.output.join('')).toContain('自动使用 PTY');
+    expect(io.output.join('')).toContain('模型: claude-sonnet-5-5');
   });
 });
