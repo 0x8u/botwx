@@ -12,6 +12,7 @@
 #   BOTWX_REF          branch, tag, or commit to install (default: main)
 #   BOTWX_HOME         installation root (default: ~/.botwx)
 #   BOTWX_INSTALL_DIR  executable directory (default: $BOTWX_HOME/bin)
+#   BOTWX_COMMAND_DIR  optional absolute directory for an additional botwx link
 #   BOTWX_ARCHIVE_URL  archive override for mirrors/testing
 #   BOTWX_BUN_INSTALL_URL  Bun installer override for mirrors/testing
 set -eu
@@ -22,6 +23,8 @@ BOTWX_ROOT="${BOTWX_HOME:-$HOME/.botwx}"
 APP_DIR="$BOTWX_ROOT/app"
 BIN_DIR="${BOTWX_INSTALL_DIR:-$BOTWX_ROOT/bin}"
 MARKER='# added by botwx installer'
+ENV_MARKER='# botwx environment'
+ORIGINAL_PATH="$PATH"
 
 err() {
   printf '%s\n' "botwx install: $*" >&2
@@ -130,13 +133,55 @@ ln -sfn "$APP_DIR/dist/index-botwx.js" "$BIN_DIR/botwx"
 printf '%s\n' "✅ installed botwx → $APP_DIR"
 printf '%s\n' "✅ executable → $BIN_DIR/botwx"
 
+# Also expose `botwx` through an already-active, writable PATH directory when
+# one is available. Unlike editing a startup file, this makes the command
+# visible to the parent shell immediately after `curl ... | sh` completes.
+# Never replace an unrelated command.
+command_dir="${BOTWX_COMMAND_DIR:-}"
+if [ -n "$command_dir" ]; then
+  case "$command_dir" in
+    /*) ;;
+    *) err "BOTWX_COMMAND_DIR must be an absolute path" ;;
+  esac
+  mkdir -p "$command_dir"
+elif ! command -v botwx >/dev/null 2>&1; then
+  old_ifs="$IFS"
+  IFS=:
+  set -- $ORIGINAL_PATH
+  IFS="$old_ifs"
+  for candidate do
+    case "$candidate" in
+      "$HOME"/*|/usr/local/bin|/opt/homebrew/bin) ;;
+      *) continue ;;
+    esac
+    [ "$candidate" != "$BIN_DIR" ] || continue
+    [ -d "$candidate" ] && [ -w "$candidate" ] || continue
+    [ ! -e "$candidate/botwx" ] && [ ! -L "$candidate/botwx" ] || continue
+    command_dir="$candidate"
+    break
+  done
+fi
+if [ -n "$command_dir" ]; then
+  command_link="$command_dir/botwx"
+  if [ ! -e "$command_link" ] && [ ! -L "$command_link" ]; then
+    ln -s "$BIN_DIR/botwx" "$command_link"
+    printf '%s\n' "✅ command available on current PATH → $command_link"
+  elif [ -L "$command_link" ] && [ "$(readlink "$command_link" 2>/dev/null || true)" = "$BIN_DIR/botwx" ]; then
+    printf '%s\n' "✅ command available on current PATH → $command_link"
+  else
+    printf '%s\n' "⚠️  kept existing command at $command_link; use $BIN_DIR/botwx" >&2
+  fi
+fi
+
 # Add the binary directory to future shells. A child installer cannot modify the
 # current parent shell, so the absolute command is also printed below.
 single_quote() {
   printf '%s' "$1" | sed "s/'/'\\\\''/g"
 }
 quoted_bin="'$(single_quote "$BIN_DIR")'"
+quoted_root="'$(single_quote "$BOTWX_ROOT")'"
 posix_line="case \":\$PATH:\" in *:$quoted_bin:*) ;; *) export PATH=$quoted_bin\":\$PATH\" ;; esac  $MARKER"
+posix_env_line="export BOTWX_HOME=$quoted_root BOTWX_BIN=$quoted_bin  $ENV_MARKER"
 
 append_once() {
   file="$1"
@@ -153,18 +198,49 @@ append_once() {
   printf '%s\n' "✓ added $BIN_DIR to PATH in $file"
 }
 
+append_env_once() {
+  file="$1"
+  line="$2"
+  mkdir -p "$(dirname "$file")"
+  if [ -f "$file" ] && grep -Fq "$ENV_MARKER" "$file" 2>/dev/null; then
+    return 0
+  fi
+  if [ -f "$file" ] && [ -n "$(tail -c 1 "$file" 2>/dev/null)" ]; then
+    printf '\n%s\n' "$line" >> "$file"
+  else
+    printf '%s\n' "$line" >> "$file"
+  fi
+  printf '%s\n' "✓ added BOTWX_HOME and BOTWX_BIN in $file"
+}
+
 case "$(basename "${SHELL:-sh}")" in
-  zsh) append_once "${ZDOTDIR:-$HOME}/.zshenv" "$posix_line" ;;
-  bash) append_once "$HOME/.bashrc" "$posix_line" ;;
+  zsh)
+    shell_file="${ZDOTDIR:-$HOME}/.zshenv"
+    append_once "$shell_file" "$posix_line"
+    append_env_once "$shell_file" "$posix_env_line"
+    ;;
+  bash)
+    shell_file="$HOME/.bashrc"
+    append_once "$shell_file" "$posix_line"
+    append_env_once "$shell_file" "$posix_env_line"
+    ;;
   fish)
     fish_file="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/botwx.fish"
     fish_line="contains $quoted_bin \$PATH; or set -gx PATH $quoted_bin \$PATH  $MARKER"
+    fish_env_line="set -gx BOTWX_HOME $quoted_root; set -gx BOTWX_BIN $quoted_bin  $ENV_MARKER"
     append_once "$fish_file" "$fish_line"
+    append_env_once "$fish_file" "$fish_env_line"
     ;;
-  *) append_once "$HOME/.profile" "$posix_line" ;;
+  *)
+    shell_file="$HOME/.profile"
+    append_once "$shell_file" "$posix_line"
+    append_env_once "$shell_file" "$posix_env_line"
+    ;;
 esac
 
 printf '\n%s\n' "Next (works immediately):"
 printf '  %s\n' "$BIN_DIR/botwx setup"
 printf '  %s\n' "$BIN_DIR/botwx start"
-printf '%s\n' "Open a new terminal to use the shorter \`botwx\` command."
+printf '%s\n' "If the shorter command is not active yet, run:"
+printf '  export PATH=%s:\"$PATH\"\n' "$quoted_bin"
+printf '%s\n' "A new terminal will load this automatically."

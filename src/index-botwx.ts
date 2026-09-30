@@ -22,6 +22,13 @@ const HELP = `botwx — 微信 ↔ AI 编程 Agent
   BOTWX_TIMEZONE            微信定时任务时区，默认跟随系统
   BOTWX_STATE_DIR           状态目录，默认 ~/.botwx
   BOTWX_ACCOUNT_ID          多账号时显式选择账号
+
+微信聊天命令:
+  /model                    查看当前模型
+  /model list               查看当前 Agent 的可选模型
+  /model <模型名>           切换模型并自动创建新会话
+  /model default            恢复 Botwx 默认模型
+  /schedule ...             创建和管理微信定时任务
 `;
 
 async function main(argv = process.argv.slice(2)): Promise<void> {

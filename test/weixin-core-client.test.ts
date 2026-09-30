@@ -62,4 +62,21 @@ describe('BotwxCoreClient', () => {
       text: 'hello',
     })).rejects.toThrow('wait_timeout: too slow');
   });
+
+  it('lets a conversation override the process-level model', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request.options.model).toBe('sonnet');
+      return new Response(JSON.stringify({ ok: true, output: { content: 'done' } }));
+    });
+    const client = new BotwxCoreClient({
+      baseUrl: 'http://127.0.0.1:7960',
+      botId: 'local_botwx',
+      model: 'claude-sonnet-5-5',
+      timeoutMs: 5_000,
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await client.chat('hl_wx_12345678', { conversationId: 'user', text: 'hello' }, { model: 'sonnet' });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
 });

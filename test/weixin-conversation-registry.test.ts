@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -31,5 +31,27 @@ describe('ConversationRegistry', () => {
     roots.push(root);
     const registry = new ConversationRegistry(join(root, 'state.json'));
     expect(registry.sessionIdFor('alice')).not.toBe(registry.sessionIdFor('bob'));
+  });
+
+  it('persists a per-conversation model, rotates the session, and migrates v1 state', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botwx-registry-'));
+    roots.push(root);
+    const file = join(root, 'state.json');
+    const seed = new ConversationRegistry(file);
+    const original = seed.sessionIdFor('alice');
+
+    const selectedSession = seed.selectModel('alice', 'claude-sonnet-5-5');
+    expect(selectedSession).not.toBe(original);
+    expect(seed.modelFor('alice')).toBe('claude-sonnet-5-5');
+    expect(readFileSync(file, 'utf8')).not.toContain('alice');
+
+    const reloaded = new ConversationRegistry(file);
+    expect(reloaded.modelFor('alice')).toBe('claude-sonnet-5-5');
+    const defaultSession = reloaded.selectModel('alice', undefined);
+    expect(defaultSession).not.toBe(selectedSession);
+    expect(new ConversationRegistry(file).modelFor('alice')).toBeUndefined();
+
+    writeFileSync(file, JSON.stringify({ schemaVersion: 1, generations: {} }));
+    expect(new ConversationRegistry(file).modelFor('alice')).toBeUndefined();
   });
 });

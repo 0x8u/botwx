@@ -4,6 +4,8 @@ import {
   start as startWeixin,
   type Bot,
 } from 'weixin-agent-sdk';
+import { CLI_MODEL_CHOICES } from '../../adapters/cli/model-choices.js';
+import type { CliId } from '../../adapters/cli/types.js';
 import { BotwxWeixinAgent } from './agent.js';
 import { readBotwxConfig, type BotwxConfig } from './config.js';
 import { ConversationRegistry } from './conversation-registry.js';
@@ -42,7 +44,13 @@ export async function startBotwx(config = readBotwxConfig()): Promise<RunningBot
     timeZone: config.scheduleTimeZone,
     log: message => console.log(message),
   });
-  const agent = new BotwxWeixinAgent({ core, conversations, scheduler });
+  const agent = new BotwxWeixinAgent({
+    core,
+    conversations,
+    defaultModel: config.model,
+    modelChoices: CLI_MODEL_CHOICES[config.cliId as CliId],
+    scheduler,
+  });
   const abortController = new AbortController();
   const stopMonitor = () => {
     scheduler.stop();

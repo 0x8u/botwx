@@ -61,7 +61,7 @@ describe('botwx install.sh', () => {
     roots.push(root);
     const home = join(root, 'home');
     const fixture = join(root, 'botwx-fixture');
-    const fakeBin = join(root, 'fake-bin');
+    const fakeBin = join(home, 'path-bin');
     mkdirSync(home, { recursive: true });
     mkdirSync(fixture, { recursive: true });
     mkdirSync(fakeBin, { recursive: true });
@@ -87,7 +87,7 @@ describe('botwx install.sh', () => {
         BOTWX_ARCHIVE_URL: `file://${archive}`,
         HOME: home,
         PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
-        SHELL: '/bin/sh',
+        SHELL: '/bin/zsh',
       },
       timeout: 30_000,
     });
@@ -96,9 +96,14 @@ describe('botwx install.sh', () => {
     expect(readFileSync(credential, 'utf8')).toBe('keep-me\n');
     expect(existsSync(join(home, '.botwx', 'app', 'dist', 'index-botwx.js'))).toBe(true);
     expect(lstatSync(join(home, '.botwx', 'bin', 'botwx')).isSymbolicLink()).toBe(true);
-    expect(readFileSync(join(home, '.profile'), 'utf8')).toContain('added by botwx installer');
+    expect(lstatSync(join(fakeBin, 'botwx')).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(home, '.zshenv'), 'utf8')).toContain('added by botwx installer');
+    expect(readFileSync(join(home, '.zshenv'), 'utf8')).toContain('BOTWX_HOME');
 
-    const smoke = spawnSync(join(home, '.botwx', 'bin', 'botwx'), [], { encoding: 'utf8' });
+    const smoke = spawnSync('botwx', [], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+    });
     expect(smoke.status, smoke.stderr).toBe(0);
     expect(smoke.stdout.trim()).toBe('fixture botwx');
   });

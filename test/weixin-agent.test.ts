@@ -86,4 +86,61 @@ describe('BotwxWeixinAgent', () => {
     expect(scheduler.handleMessage).toHaveBeenCalledOnce();
     expect(core.chat).not.toHaveBeenCalled();
   });
+
+  it('lists, switches, persists, and resets models from WeChat commands', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botwx-agent-'));
+    roots.push(root);
+    const file = join(root, 'conversations.json');
+    const calls: Array<{ sessionId: string; model?: string }> = [];
+    const core = {
+      chat: vi.fn(async (sessionId: string, _request: unknown, options?: { model?: string }) => {
+        calls.push({ sessionId, model: options?.model });
+        return 'agent reply';
+      }),
+    } as unknown as BotwxCoreClient;
+    const agent = new BotwxWeixinAgent({
+      core,
+      conversations: new ConversationRegistry(file),
+      defaultModel: 'claude-sonnet-5-5',
+      modelChoices: ['claude-sonnet-5-5', 'sonnet', 'opus'],
+    });
+
+    await expect(agent.chat({ conversationId: 'wx-user', text: '/model list' }))
+      .resolves.toMatchObject({ text: expect.stringContaining('claude-sonnet-5-5') });
+    expect(core.chat).not.toHaveBeenCalled();
+
+    const switchModel = agent.chat({ conversationId: 'wx-user', text: '/model sonnet' });
+    const firstSonnetTurn = agent.chat({ conversationId: 'wx-user', text: 'hello' });
+    await expect(switchModel)
+      .resolves.toEqual({ text: '✅ 已切换模型：sonnet\n已自动创建新会话，下一条消息开始生效。' });
+    await expect(firstSonnetTurn)
+      .resolves.toEqual({ text: 'agent reply' });
+    expect(calls[0]?.model).toBe('sonnet');
+    expect(new ConversationRegistry(file).modelFor('wx-user')).toBe('sonnet');
+
+    await expect(agent.chat({ conversationId: 'wx-user', text: '/model default' }))
+      .resolves.toEqual({ text: '✅ 已恢复默认模型：claude-sonnet-5-5\n已自动创建新会话。' });
+    await agent.chat({ conversationId: 'wx-user', text: 'again' });
+    expect(calls[1]?.model).toBe('claude-sonnet-5-5');
+    expect(calls[1]?.sessionId).not.toBe(calls[0]?.sessionId);
+  });
+
+  it('rejects unknown models without changing the session', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botwx-agent-'));
+    roots.push(root);
+    const conversations = new ConversationRegistry(join(root, 'conversations.json'));
+    const sessionId = conversations.sessionIdFor('wx-user');
+    const core = { chat: vi.fn() } as unknown as BotwxCoreClient;
+    const agent = new BotwxWeixinAgent({
+      core,
+      conversations,
+      defaultModel: 'claude-sonnet-5-5',
+      modelChoices: ['claude-sonnet-5-5', 'sonnet'],
+    });
+
+    await expect(agent.chat({ conversationId: 'wx-user', text: '/model imaginary-model' }))
+      .resolves.toMatchObject({ text: expect.stringContaining('不支持或未列出模型') });
+    expect(conversations.sessionIdFor('wx-user')).toBe(sessionId);
+    expect(core.chat).not.toHaveBeenCalled();
+  });
 });

@@ -41,13 +41,24 @@ curl -fsSL https://raw.githubusercontent.com/0x8u/botwx/main/install.sh | sh
 ~/.botwx/bin/botwx start   # 前台启动微信连接器和 Agent 内核
 ```
 
-安装器会自动补齐 Bun 1.4.2、下载 GitHub 源码快照、按 `bun.lock` 安装依赖、完成构建，并把
-`~/.botwx/bin` 写入 shell 的 PATH。新开终端后可以直接使用短命令：
+安装器会自动补齐 Bun 1.4.2、下载 GitHub 源码快照、按 `bun.lock` 安装依赖并完成构建。
+它会把 `~/.botwx/bin`、`BOTWX_HOME` 和 `BOTWX_BIN` 写入 shell 启动文件；如果当前
+`PATH` 中存在安全、可写的命令目录，还会在那里创建 `botwx` 链接，让短命令立即可用：
 
 ```bash
 botwx setup
 botwx start
 ```
+
+`curl ... | sh` 运行在子进程中，无法直接修改已经打开的父 shell。如果安装结束后当前
+终端仍提示 `command not found`，无需重新安装，执行一次：
+
+```bash
+export PATH="$HOME/.botwx/bin:$PATH"
+rehash 2>/dev/null || true
+```
+
+新开的终端会自动读取安装器写入的 PATH。
 
 如果使用 fork，可以通过环境变量覆盖仓库和分支，让用户这样安装：
 
@@ -257,6 +268,7 @@ bun run dev
 
 | 现象 | 处理方式 |
 |---|---|
+| `zsh: command not found: botwx` | 执行 `export PATH="$HOME/.botwx/bin:$PATH"`；安装器已把 PATH 持久写入 `~/.zshenv`，新终端会自动生效 |
 | `微信尚未登录` | 重新执行 `botwx login` 并扫码，再用 `botwx status` 确认 |
 | `codex` / `claude` / `gemini` 找不到 | 安装对应 CLI，并在普通终端中先完成一次登录和问答 |
 | 首条消息进入后没有回复 | 查看启动终端中的 Agent 登录、模型额度或目录权限错误；先直接运行该 CLI 验证 |
@@ -307,6 +319,27 @@ botwx status
 直接问模型“你是什么版本”并不可靠；模型生成的自我描述可能沿用训练语料中的旧名称。
 Botwx 的可靠依据是 `status` 显示的配置，以及启动时实际传给 Claude Code 的
 `--model` 参数。
+
+### 在微信中切换模型
+
+模型选择是 Botwx 的连接器原生命令，不依赖 Agent 自己理解自然语言：
+
+```text
+/model                         # 当前模型与用法
+/model list                    # 当前 Agent 支持的模型
+/model claude-sonnet-5-5       # 固定使用 Sonnet 5.5
+/model sonnet                  # Claude Code 的最新 Sonnet 别名
+/model opus                    # 切换为 Claude Code 的 Opus 别名
+/model default                 # 恢复 ~/.botwx/.env 中的默认值
+```
+
+每个微信用户的选择相互隔离，且只以微信会话 ID 的 SHA-256 摘要持久化。切换成功后
+Botwx 会自动轮换到新会话，下一条消息生效，避免不同模型共享不兼容的历史推理块。
+输入不在当前 CLI 模型列表中的名字会被拒绝；可以先发送 `/model list` 查看。
+
+`botwx status` 显示进程级默认模型，微信中的 `/model` 显示这个微信对话当前真正选择的
+模型。切换模型不会切换 Agent CLI；例如 `BOTWX_CLI=claude-code` 时只能选择 Claude
+Code 支持的模型。如需从 Claude Code 改成 Codex，需要修改 `BOTWX_CLI` 并重启 Botwx。
 
 ## 媒体消息
 

@@ -36,14 +36,15 @@ async function bodyOf(request: import('node:http').IncomingMessage): Promise<Rec
 }
 
 describe('WeChat connector end to end', () => {
-  it('long-polls with the real SDK, executes through the core API, and replies to WeChat', async () => {
+  it('switches models in WeChat, executes through the core API, and replies with the real SDK', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botwx-e2e-'));
     roots.push(root);
     process.env.OPENCLAW_STATE_DIR = root;
 
-    let updateDelivered = false;
+    let deliveredUpdates = 0;
     let coreRequest: Record<string, any> | undefined;
     let sentMessage: Record<string, any> | undefined;
+    const sentTexts: string[] = [];
     let resolveSent!: () => void;
     const sent = new Promise<void>(resolve => { resolveSent = resolve; });
 
@@ -52,11 +53,23 @@ describe('WeChat connector end to end', () => {
       if (path === '/ilink/bot/getupdates') {
         await bodyOf(request);
         response.setHeader('content-type', 'application/json');
-        if (!updateDelivered) {
-          updateDelivered = true;
+        if (deliveredUpdates === 0) {
+          deliveredUpdates += 1;
           response.end(JSON.stringify({
             ret: 0,
             get_updates_buf: 'cursor-1',
+            msgs: [{
+              from_user_id: 'wx-user-e2e',
+              create_time_ms: Date.now(),
+              context_token: 'ctx-model',
+              item_list: [{ type: 1, text_item: { text: '/model sonnet' } }],
+            }],
+          }));
+        } else if (deliveredUpdates === 1) {
+          deliveredUpdates += 1;
+          response.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: 'cursor-2',
             msgs: [{
               from_user_id: 'wx-user-e2e',
               create_time_ms: Date.now(),
@@ -65,7 +78,7 @@ describe('WeChat connector end to end', () => {
             }],
           }));
         } else {
-          response.end(JSON.stringify({ ret: 0, get_updates_buf: 'cursor-1', msgs: [] }));
+          response.end(JSON.stringify({ ret: 0, get_updates_buf: 'cursor-2', msgs: [] }));
         }
         return;
       }
@@ -93,9 +106,11 @@ describe('WeChat connector end to end', () => {
       }
       if (path === '/ilink/bot/sendmessage') {
         sentMessage = await bodyOf(request) as Record<string, any>;
+        const text = String(sentMessage.msg?.item_list?.[0]?.text_item?.text ?? '');
+        sentTexts.push(text);
         response.setHeader('content-type', 'application/json');
         response.end('{}');
-        resolveSent();
+        if (text.includes('Botwx E2E OK')) resolveSent();
         return;
       }
       response.statusCode = 404;
@@ -123,6 +138,8 @@ describe('WeChat connector end to end', () => {
     const agent = new BotwxWeixinAgent({
       core,
       conversations: new ConversationRegistry(join(root, 'conversations.json')),
+      defaultModel: 'claude-sonnet-5-5',
+      modelChoices: ['claude-sonnet-5-5', 'sonnet'],
     });
     const abortController = new AbortController();
     const bot = start(agent, {
@@ -145,6 +162,8 @@ describe('WeChat connector end to end', () => {
     expect(coreRequest?.source.requestId).toMatch(/^hl_wx_[A-Za-z0-9_-]{43}$/);
     expect(coreRequest?.envelope.rawText).toBe('请完成端到端测试');
     expect(coreRequest?.options.timeoutMs).toBe(300_000);
+    expect(coreRequest?.options.model).toBe('sonnet');
+    expect(sentTexts).toContain('✅ 已切换模型：sonnet\n已自动创建新会话，下一条消息开始生效。');
     expect(sentMessage?.msg.to_user_id).toBe('wx-user-e2e');
     expect(sentMessage?.msg.context_token).toBe('ctx-e2e');
     expect(sentMessage?.msg.item_list[0].text_item.text).toBe('Botwx E2E OK');

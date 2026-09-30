@@ -47,6 +47,17 @@ is not already available. `setup` detects an installed agent CLI, selects the wo
 backend, writes `~/.botwx/.env`, and starts WeChat QR login. Open a new terminal
 after installation to use the shorter `botwx` command directly.
 
+The installer persists `~/.botwx/bin` in `PATH` and exports `BOTWX_HOME` and
+`BOTWX_BIN`. It also creates a non-destructive `botwx` link in an already-active,
+writable PATH directory when possible. Because `curl ... | sh` runs in a child
+process, it cannot mutate the parent shell. If the current terminal still says
+`command not found`, run:
+
+```bash
+export PATH="$HOME/.botwx/bin:$PATH"
+rehash 2>/dev/null || true
+```
+
 ## Source quick start
 
 Node.js 22+, Bun 1.4.2, tmux, and one supported agent CLI are required. The
@@ -89,6 +100,26 @@ BOTWX_MODEL=claude-sonnet-5-5
 Run `botwx status` to inspect the effective Agent and model configuration.
 Asking a model to identify itself is not a reliable version check because that
 answer is generated content and can use an outdated name.
+
+### Switching models from WeChat
+
+Botwx handles model selection as connector-native commands:
+
+```text
+/model
+/model list
+/model claude-sonnet-5-5
+/model sonnet
+/model opus
+/model default
+```
+
+Selections are isolated and persisted per hashed WeChat conversation. A
+successful switch automatically rotates to a fresh Agent session and applies
+to the next message. Unknown models are rejected against the current CLI's
+curated model list. `/model` shows the effective model for that conversation;
+`botwx status` shows the process-level default. Model switching does not switch
+the underlying CLI.
 
 ## WeChat schedules
 

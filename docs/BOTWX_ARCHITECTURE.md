@@ -23,12 +23,25 @@ Botwx 把“IM 接入”与“Agent 执行”拆成两个明确边界：
 
 ## 会话模型
 
-WeChat `conversationId` 不直接持久化。`ConversationRegistry` 存储它的 SHA-256 摘要和 reset generation，并派生符合内核约束的 `hl_wx_*` headless id。
+WeChat `conversationId` 不直接持久化。`ConversationRegistry` 存储它的 SHA-256 摘要、
+reset generation 和可选模型选择，并派生符合内核约束的 `hl_wx_*` headless id。
 
 - 同一微信用户的后续消息稳定命中同一个 CLI session。
 - 不同用户的摘要与 session 完全隔离。
 - `/clear` 只递增 generation，新消息进入新 session，旧历史不被破坏性删除。
 - 每个 conversation 有独立 FIFO，同用户并发消息不会争抢同一 CLI 轮次；不同用户仍可并行。
+
+## 微信原生模型选择
+
+`/model` 命令在进入执行内核前由连接器确定性处理。模型候选来自当前 CLI adapter 的
+策展列表，未知名字不会直接传入进程参数。
+
+- `/model list` 列出当前 CLI 的候选；`/model <id>` 选择；`/model default` 清除覆盖。
+- 选择只按 conversation 的 SHA-256 owner key 持久化，不记录原始微信 ID。
+- 切换模型与 generation 递增在同一次原子持久化中完成，下一条消息必然使用新 session。
+- FIFO 以稳定 owner key 排队，而不是以可轮换的 session id 排队，避免并发消息在切换时
+  误投到旧模型 session。
+- 每轮选择通过 core-only `options.model` 传入，进而由 CLI adapter 生成实际模型参数。
 
 ## 微信原生定时任务
 

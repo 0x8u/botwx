@@ -16,6 +16,11 @@ export interface BotwxCoreClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface BotwxTurnOptions {
+  /** Per-conversation override. Omit to use the process-level default. */
+  model?: string;
+}
+
 function mediaEnvelope(media: ChatRequest['media']): Record<string, string> | undefined {
   if (!media) return undefined;
   return {
@@ -40,12 +45,17 @@ export class BotwxCoreClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async chat(sessionId: string, request: ChatRequest): Promise<string> {
+  async chat(
+    sessionId: string,
+    request: ChatRequest,
+    turnOptions: BotwxTurnOptions = {},
+  ): Promise<string> {
     const controller = new AbortController();
     const clientTimeoutMs = this.options.timeoutMs + 10_000;
     const timeout = setTimeout(() => controller.abort(), clientTimeoutMs);
     try {
       const media = mediaEnvelope(request.media);
+      const model = turnOptions.model ?? this.options.model;
       const response = await this.fetchImpl(new URL('/api/trigger', this.options.baseUrl), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -76,7 +86,7 @@ export class BotwxCoreClient {
           options: {
             waitForFinalOutput: true,
             timeoutMs: this.options.timeoutMs,
-            ...(this.options.model ? { model: this.options.model } : {}),
+            ...(model ? { model } : {}),
             ...(this.options.reasoningEffort ? { reasoningEffort: this.options.reasoningEffort } : {}),
           },
         }),
